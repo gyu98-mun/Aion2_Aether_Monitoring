@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>아이온2 오드에너지 대시보드</title>
+<style>
+  :root {
+    --bg: #0f1420;
+    --card-bg: #1a2233;
+    --card-border: #2a3550;
+    --accent: #5fb4ff;
+    --accent-2: #ffb454;
+    --text: #e6ecf5;
+    --text-dim: #8fa0bf;
+    --up: #58d68d;
+    --down: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  h1 {
+    font-size: 22px;
+    margin: 0;
+  }
+  #status {
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  #status.error { color: var(--down); }
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+  .nickname {
+    font-size: 17px;
+    font-weight: 600;
+  }
+  .entity-id {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .total {
+    font-size: 34px;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 8px 0 2px;
+  }
+  .breakdown {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+  .breakdown b { color: var(--text); font-weight: 500; }
+  .last-updated {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+  .delta-badge {
+    display: inline-block;
+    font-size: 12px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    margin-left: 6px;
+  }
+  .delta-badge.up { background: rgba(88,214,141,0.15); color: var(--up); }
+  .delta-badge.down { background: rgba(255,107,107,0.15); color: var(--down); }
+  details {
+    margin-top: 6px;
+  }
+  summary {
+    cursor: pointer;
+    font-size: 12.5px;
+    color: var(--accent-2);
+    user-select: none;
+  }
+  .history-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 8px;
+    font-size: 12px;
+  }
+  .history-table th, .history-table td {
+    text-align: left;
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--card-border);
+    color: var(--text-dim);
+  }
+  .history-table td.delta-up { color: var(--up); }
+  .history-table td.delta-down { color: var(--down); }
+  .history-scroll {
+    max-height: 160px;
+    overflow-y: auto;
+  }
+  #empty {
+    color: var(--text-dim);
+    font-size: 14px;
+    padding: 40px 0;
+    text-align: center;
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>오드에너지 대시보드</h1>
+  <span id="status">불러오는 중...</span>
+</header>
+
+<div id="grid"></div>
+<div id="empty">아직 데이터가 없습니다. aion2_live_monitor.py를 켜고 캐릭터로 접속해보세요.</div>
+
+<script>
+const REFRESH_MS = 2000;
+const grid = document.getElementById('grid');
+const statusEl = document.getElementById('status');
+const emptyEl = document.getElementById('empty');
+
+function fmtTime(iso) {
+  if (!iso) return '-';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString('ko-KR', { hour12: false });
+}
+
+function relTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const diffSec = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diffSec < 5) return '방금 전';
+  if (diffSec < 60) return diffSec + '초 전';
+  if (diffSec < 3600) return Math.floor(diffSec / 60) + '분 전';
+  if (diffSec < 86400) return Math.floor(diffSec / 3600) + '시간 전';
+  return Math.floor(diffSec / 86400) + '일 전';
+}
+
+function deltaBadge(delta) {
+  if (delta === null || delta === undefined) return '';
+  const cls = delta >= 0 ? 'up' : 'down';
+  const sign = delta >= 0 ? '+' : '';
+  return `<span class="delta-badge ${cls}">${sign}${delta}</span>`;
+}
+
+function renderHistory(history) {
+  if (!history || history.length === 0) {
+    return '<div style="color:var(--text-dim);font-size:12px;padding-top:6px;">기록 없음</div>';
+  }
+  const rows = history.slice().reverse().map(h => {
+    const dCls = (h.delta === null || h.delta === undefined) ? '' :
+      (h.delta >= 0 ? 'delta-up' : 'delta-down');
+    const dText = (h.delta === null || h.delta === undefined) ? '-' :
+      (h.delta >= 0 ? '+' + h.delta : h.delta);
+    return `<tr>
+      <td>${fmtTime(h.timestamp)}</td>
+      <td class="${dCls}">${dText}</td>
+      <td>${h.oath_energy ?? '-'}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="history-scroll">
+    <table class="history-table">
+      <thead><tr><th>시각</th><th>변화</th><th>총량</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+function renderCard(record) {
+  const name = record.nickname || `캐릭터(id=${record.entity_id})`;
+  const total = record.oath_energy ?? '?';
+  const base = record.oath_energy_base;
+  const dynamic = record.oath_energy_dynamic;
+  const hasBreakdown = base !== null && base !== undefined && dynamic !== null && dynamic !== undefined;
+
+  const breakdownHtml = hasBreakdown
+    ? `왼쪽 <b>${base}</b> + 오른쪽 <b>${dynamic}</b> = ${base + dynamic}`
+    : '왼쪽/오른쪽 값 아직 확인 안 됨';
+
+  return `
+    <div class="card">
+      <div class="card-head">
+        <span class="nickname">${name}</span>
+        <span class="entity-id">id=${record.entity_id}</span>
+      </div>
+      <div class="total">${total}${deltaBadge(record.last_delta)}</div>
+      <div class="breakdown">${breakdownHtml}</div>
+      <div class="last-updated">마지막 갱신: ${relTime(record.last_updated)} (${fmtTime(record.last_updated)})</div>
+      <details>
+        <summary>최근 변경 이력 (${(record.history || []).length}건)</summary>
+        ${renderHistory(record.history)}
+      </details>
+    </div>
+  `;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/characters', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const records = Object.values(data).sort((a, b) => {
+      return (b.last_updated || '').localeCompare(a.last_updated || '');
+    });
+
+    if (records.length === 0) {
+      grid.innerHTML = '';
+      emptyEl.style.display = 'block';
+    } else {
+      emptyEl.style.display = 'none';
+      grid.innerHTML = records.map(renderCard).join('');
+    }
+
+    statusEl.textContent = '마지막 새로고침: ' + new Date().toLocaleTimeString('ko-KR', { hour12: false });
+    statusEl.classList.remove('error');
+  } catch (e) {
+    statusEl.textContent = '서버에 연결할 수 없음 (aion2_dashboard_server.py가 켜져 있는지 확인)';
+    statusEl.classList.add('error');
+  }
+}
+
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+
+</body>
+</html>

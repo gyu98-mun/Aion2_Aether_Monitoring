@@ -1,0 +1,31 @@
+{
+  "51591": {
+    "entity_id": 51591,
+    "nickname": "쌍검성",
+    "server": 1002,
+    "job": 18,
+    "oath_energy": 1065,
+    "last_delta": 975,
+    "last_updated": "2026-07-07T23:14:29",
+    "oath_energy_base": 15,
+    "oath_energy_dynamic": 1050
+  },
+  "0": {
+    "entity_id": 0,
+    "nickname": "활성성",
+    "server": 1002,
+    "job": 14,
+    "oath_energy": 0,
+    "last_delta": 0,
+    "last_updated": "2026-07-07T22:10:49"
+  },
+  "74292": {
+    "entity_id": 74292,
+    "nickname": "활성성",
+    "server": 1002,
+    "job": 14,
+    "oath_energy": 1,
+    "last_delta": -1,
+    "last_updated": "2026-07-07T22:38:19"
+  }
+}
