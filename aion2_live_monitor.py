@@ -32,38 +32,49 @@ opcode (0x0C, 0x61) 패킷을 실시간으로 잡아서 파싱한다 (자세한 
 주의:
     - opcode (0x0C, 0x61) 은 "오드에너지가 바뀔 때"만 옴 (절대값 스냅샷이 아니라 변경 이벤트).
     - opcode (0x0B, 0x61) 은 캐릭터가 월드에 들어올 때(로딩 완료 시점) 1회 오는 "전체 스탯 동기화"
-      패킷으로, 여기에 로그인 시점의 오드에너지 절대값이 들어있다 (999.pcapng 로 검증: 로그인 직전
-      확인한 실제 값 1370과 정확히 일치). 캡처를 캐릭터 선택 화면에서부터 미리 켜두면 이 패킷을 잡아서
-      프로그램을 켠 직후부터 바로 정확한 절대값이 표시된다. 다만 이 패킷의 정확한 바이트 구조가
-      세션마다 100% 동일하진 않아서(확인된 예외: 888888.pcapng), 못 잡는 세션도 있을 수 있음 -
-      그런 경우엔 기존처럼 다음 아이템 사용/소모 이벤트가 올 때까지 절대값을 알 수 없다.
+      패킷으로, 여기에 로그인 시점의 오드에너지 절대값이 들어있다.
     - 아무 반응이 없으면: (1) 관리자 권한으로 실행했는지, (2) --iface 로 올바른 인터페이스를
       지정했는지, (3) --debug 로 서버 패킷 자체가 잡히는지부터 확인할 것.
     - 캐릭터 닉네임(OwnNickname, opcode 0x33/0x36)의 entity_id 는 접속할 때마다 바뀌는 작은
-      임시 id 라서 오드에너지 entity_id(영속값)와 숫자로 매칭되지 않는다. 그래서 "같은 접속
+      임시 id 라서 오드에너지 entity_id(계정 공용값)와 숫자로 매칭되지 않는다. 그래서 "같은 접속
       세션 동안 확인한 닉네임"을 오드에너지 이벤트가 올 때 그 이벤트의 entity_id 에 붙이는
       방식으로 연결한다 (LiveCapture.current_nickname / replay_pcap 의 current 딕셔너리 참고).
+    - **저장소는 닉네임을 키로 쓴다 (2026-07-08 변경).** entity_id는 계정/슬롯 공용값이라 여러
+      캐릭터가 같은 id를 공유한다 - entity_id를 키로 쓰면 캐릭터를 바꿀 때마다 같은 레코드가
+      계속 덮어써진다(사용자 실측: "JSON 구조가 좀 이상해 하나의 data만 계속 갱신되는 것 같아").
+      그래서 오드에너지/전투력 데이터는 "이번 세션에서 확인된 닉네임"(current_nickname)이 있을
+      때만 저장소에 쓰고, 아직 모르면(캐릭터 접속 직후 5~6초 텀) pending_oath에 메모리로만
+      들고 있다가 닉네임이 확인되는 순간 병합해서 저장한다 - 잘못된 캐릭터 이름 아래 데이터가
+      쓰이는 일이 구조적으로 불가능해진다.
     - opcode (0x0C, 0x61) 은 오드에너지 말고 다른 것(맵 이벤트/카운터 등)에도 재사용된다는 게
       실제 캡처(각성전1/2.pcapng)로 확인됨 - "감소" 서브타입(delta 필드 없음)은 총량 값 하나만
       가지고 있어 자체적으로는 진짜인지 검증할 방법이 없다. 그래서 "이전에 실제로 오드에너지로
       확인된 entity_id"와 다르면 무시하도록 되어있다 (자세한 원리는 LiveCapture._is_trusted_oath_event
-      참고). oath_energy_data.json 에 이미 기록이 있으면 그 id를 기준으로 삼고, 완전히 처음 실행
-      (파일이 비어있음)이면 첫 이벤트를 일단 신뢰하고 그 id를 기준으로 삼는다 - 이 경우 아주 드물게
-      (파일이 비어있는 상태에서 세션 첫 오드에너지 이벤트가 하필 이 재사용 패킷과 겹치면) 잘못된
-      id가 기준으로 잡힐 수 있음. 그럴 땐 오드에너지가 갑자기 이상한 값(1 근처)으로 보이고 그 뒤로도
-      계속 그 상태면, oath_energy_data.json 에서 잘못 잡힌 항목을 지우고 다시 실행하면 된다.
+      참고).
 """
 
 import argparse
+import datetime
 import ipaddress
 import queue
 import struct
 import sys
 import threading
 import time
+import types
 
 from aion2_core import StreamProcessor, StreamAssembler, LiveTcpReassembler
 from aion2_storage import CharacterStore
+
+# exe로 묶을 때(--noconsole/--windowed) 콘솔이 없으면 sys.stdout/stderr 가 None이 되어
+# print() 호출이 그대로 죽는다 (AttributeError: 'NoneType' object has no attribute 'write').
+# 콘솔 유무와 상관없이 항상 안전하게 동작하도록 더미 스트림으로 대체한다.
+if getattr(sys, "frozen", False) and (sys.stdout is None or sys.stderr is None):
+    import io
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
 
 DEFAULT_SERVER_NET = "206.127.156.0/24"
 DEFAULT_PORT = 13328
@@ -149,18 +160,16 @@ class LiveCapture:
         self.matched_packet_count = 0
         self.first_packet_seen = False
         self.last_dynamic = None  # 직전에 확인된 "오른쪽 숫자"(누적분, delta 필드 없는 패킷용)
-        self.store = CharacterStore()  # 캐릭터별 오드에너지 로컬 저장소 (oath_energy_data.json)
-        # 2026-07-07 추가: opcode(0x0C,0x61)가 오드에너지가 아닌 다른 용도(맵 이벤트 카운터 등)로도
-        # 재사용된다는 게 실제 캡처(각성전1/2.pcapng)에서 확인됨 - "이번에 추적 중인 진짜 오드에너지
-        # entity_id"를 알고 있으면, 그와 다른 id로 온 (교차검증 불가능한) "감소" 타입 이벤트를 걸러낸다.
-        # 재실행 시 이전 세션에서 확인된 id를 저장소에서 이어받아 시작 (콜드스타트 완화).
-        # 새 TCP 연결(재접속)에도 리셋하지 않는다 - "어떤 캐릭터를 추적 중인가"는 세션과 무관.
-        self.known_oath_id = self.store.most_recent_oath_entity_id()
-        # 2026-07-07 추가: "왼쪽 숫자"(정기 충전분) 버그 수정. 실제 총 오드에너지 = base(왼쪽) +
-        # dynamic(오른쪽). base 는 로그인 스냅샷(opcode 0x0B,0x61)에서만 얻을 수 있고, 평소
-        # opcode(0x0C,0x61) 변경 이벤트는 dynamic 만 갱신한다 (아래 _on_oath_energy 참고).
-        # 저장소에 이전에 확인된 base 가 있으면 이어받아 콜드스타트를 완화한다.
-        self.known_base = self.store.get_known_base(self.known_oath_id) if self.known_oath_id else 0
+        self.store = CharacterStore()  # 캐릭터별 오드에너지 로컬 저장소 (oath_energy_data.json, 닉네임 키)
+
+        # 2026-07-08: 저장소가 닉네임 키로 바뀌면서, "지난 세션에 마지막으로 활동한 캐릭터"를
+        # 이어받아 콜드스타트를 완화한다. entity_id/base는 패킷 신뢰 검증과 총량 계산용 참고값일
+        # 뿐, 실제로 이 캐릭터가 이번 세션에도 접속했는지는 아래에서 확인되는 닉네임으로 재검증된다.
+        last_nickname = self.store.most_recent_character()
+        last_record = self.store.data.get(last_nickname, {}) if last_nickname else {}
+        self.known_oath_id = last_record.get("entity_id")
+        self.known_base = last_record.get("oath_energy_base") or 0
+
         self._build_pipeline()
         self._stop = threading.Event()
         self._thread = None
@@ -171,16 +180,24 @@ class LiveCapture:
             on_nickname=self._on_nickname,
             on_unknown=self._on_unknown if self.debug else None,
             get_known_oath_id=lambda: self.known_oath_id,
+            on_combat_power=self._on_combat_power,
         )
         assembler = StreamAssembler(proc)
         self.live_reassembler = LiveTcpReassembler(assembler)
         # OwnNickname 의 entity_id 는 세션마다 바뀌는 작은 임시 id라서 오드에너지의
-        # 영속 id 와 숫자로 직접 매칭이 안 된다 (aion2_core.py의 parse_own_nickname_packet
+        # 계정 공용 id 와 숫자로 직접 매칭이 안 된다 (aion2_core.py의 parse_own_nickname_packet
         # 문서 참고). 대신 "같은 접속 세션 동안 확인한 닉네임"을 오드에너지 이벤트가 올 때
-        # 그 이벤트의 entity_id 에 붙여주는 방식으로 연결한다. 새 연결(재접속)마다 리셋.
+        # 그 이벤트의 entity_id 에 붙여주는 방식으로 연결한다. 새 연결(재접속)마다 리셋 -
+        # 재접속은 캐릭터 전환(캐릭터 선택 화면 경유)일 수 있으므로, 예전 닉네임을 새로 들어오는
+        # 오드에너지 데이터에 잘못 붙이지 않기 위해서다.
         self.current_nickname = None
         self.current_server = None
         self.current_job = None
+        # 2026-07-08 추가: 닉네임이 아직 확인 안 된 entity_id의 오드에너지/전투력 데이터를 메모리에만
+        # 들고 있는 임시 보관함. 닉네임이 확인되면(_on_nickname) 병합해서 저장소에 반영한다 - 저장소는
+        # "닉네임이 확정된 데이터만 받는다"는 계약을 지켜서, entity_id가 계정 공용이라 생기는
+        # "엉뚱한 캐릭터 이름 아래 데이터가 쓰이는" 문제를 구조적으로 막는다.
+        self.pending_oath = {}
 
     def _on_oath_energy(self, ev):
         # 2026-07-07 추가: id 신뢰 검증. delta 필드가 있는 "증가" 타입은 total/delta 두 값이
@@ -202,6 +219,19 @@ class LiveCapture:
         if getattr(ev, "is_snapshot", False):
             self.known_base = getattr(ev, "base", 0) or 0
             dynamic = getattr(ev, "dynamic", ev.new_total)
+            # 2026-07-08 수정: 로그인 스냅샷 = 캐릭터가 (재)입장했다는 신호. entity_id가
+            # 계정 공용이라 이 시점에 이전 캐릭터의 current_nickname이 그대로 남아있으면
+            # 새 캐릭터의 데이터가 이전 캐릭터 이름 아래에 잘못 저장된다. 닉네임이 다시
+            # 확인될 때까지 pending_oath로 돌리기 위해 여기서 리셋한다.
+            self.current_nickname = None
+            self.current_server = None
+            self.current_job = None
+            # GUI 표는 entity_id -> 마지막 확인 닉네임(entity_nickname)을 별도로 캐싱해서
+            # 닉네임 없는 이벤트를 라우팅한다. 이 캐시는 core의 current_nickname과 독립적이라
+            # 여기서 리셋만 해선 안 지워지고, 그러면 표에서 "이전 캐릭터 행"이 새 캐릭터
+            # 데이터로 잘못 덮어써진다(저장소는 정상이어도 화면만 오염됨). forget_entity_id
+            # 이벤트로 GUI 쪽 캐시도 함께 무효화한다.
+            self.event_queue.put(types.SimpleNamespace(forget_entity_id=ev.entity_id))
         else:
             dynamic = ev.new_total
 
@@ -217,15 +247,36 @@ class LiveCapture:
             )
 
         self.known_oath_id = ev.entity_id
+
+        # 2026-07-08 재구성: 저장소는 닉네임 키다. 이번 세션에서 이 entity_id의 닉네임이 이미
+        # 확인됐으면(self.current_nickname) 바로 저장하고, 아직이면 pending_oath에만 담아둔다
+        # (저장소엔 안 씀 - 닉네임 확인 전에 저장하면 "이전 캐릭터 이름" 아래 새 데이터가 쓰이는
+        # 예전 버그가 재발한다).
         if self.current_nickname:
-            self.store.update_nickname(ev.entity_id, self.current_nickname, self.current_server, self.current_job)
-        self.store.update_oath_energy(ev.entity_id, ev.new_total, ev.delta, base=self.known_base, dynamic=dynamic)
-        ev.display_name = self.store.get_display_name(ev.entity_id)
-        # GUI가 대시보드와 같은 내용(닉네임/왼쪽·오른쪽 분리/최근 이력)을 보여줄 수 있도록,
-        # 저장 직후의 레코드 전체를 이벤트에 실어 보낸다 (2026-07-08 추가). history 리스트는
-        # 캡처 스레드가 이후 계속 append 할 수 있으므로 얕은 복사로 스냅샷을 떠서 넘긴다.
-        record = self.store.data.get(str(ev.entity_id), {})
-        ev.record = {**record, "history": list(record.get("history", []))}
+            self.store.update_character_info(
+                self.current_nickname, entity_id=ev.entity_id,
+                server=self.current_server, job=self.current_job,
+            )
+            self.store.update_oath_energy(
+                self.current_nickname, ev.new_total, ev.delta,
+                base=self.known_base, dynamic=dynamic, entity_id=ev.entity_id,
+            )
+            ev.display_name = self.current_nickname
+            ev.record = dict(self.store.data.get(self.current_nickname, {}))
+        else:
+            pending = self.pending_oath.setdefault(ev.entity_id, {})
+            pending.update({
+                "oath_energy": ev.new_total,
+                "oath_energy_base": self.known_base,
+                "oath_energy_dynamic": dynamic,
+                "last_delta": ev.delta,
+                "last_updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+            ev.display_name = f"캐릭터(id={ev.entity_id})"
+            ev.record = {"entity_id": ev.entity_id, "nickname": None, **pending}
+
+        # 이 이벤트 자체는 닉네임을 새로 확인해준 이벤트가 아니다 (GUI의 upsert_status_row 참고).
+        ev.nickname_confirmed = False
         self.event_queue.put(ev)
 
     def _is_trusted_oath_event(self, ev):
@@ -240,6 +291,46 @@ class LiveCapture:
         self.current_server = ev.server
         self.current_job = ev.job
         self.status_queue.put(f"캐릭터 닉네임 확인: {ev.nickname}")
+
+        # 닉네임(OwnNickname)은 실측상 오드에너지 로그인 스냅샷보다 5~6초 "늦게" 온다. 이미
+        # 추적 중인 오드에너지 entity_id를 알고 있으면(known_oath_id), pending_oath에 쌓아둔
+        # 데이터를 이 닉네임으로 즉시 병합/반영하고 GUI에도 바로 알린다 - 다음 오드에너지
+        # 이벤트를 기다리지 않는다.
+        if self.known_oath_id is not None:
+            self.store.update_character_info(
+                ev.nickname, entity_id=self.known_oath_id, server=ev.server, job=ev.job,
+            )
+            pending = self.pending_oath.pop(self.known_oath_id, None)
+            if pending:
+                self.store.update_oath_energy(
+                    ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
+                    base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
+                    entity_id=self.known_oath_id,
+                )
+                if pending.get("combat_power") is not None:
+                    self.store.update_combat_power(
+                        ev.nickname, pending["combat_power"], entity_id=self.known_oath_id,
+                    )
+            record_snapshot = dict(self.store.data.get(ev.nickname, {}))
+            self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
+
+    def _on_combat_power(self, ev):
+        # 2026-07-08: opcode(0x56,0x36)엔 entity_id 필드가 없어서(닉네임과 동일한 상황), 지금
+        # 추적 중인 오드에너지 entity_id(known_oath_id)에 그대로 붙인다. 확정된 설계: 캐릭터
+        # 인식(known_oath_id)이 아예 안 된 상태면 전투력도 무시한다 ("캐릭터 인식이 되어있어야
+        # 전투력이 인식되는것이 좋아" - 사용자 확인). 닉네임이 아직 확인 전이면(current_nickname
+        # 없음) pending_oath에만 담아두고 저장소엔 안 쓴다 (오드에너지와 동일한 이유).
+        if self.known_oath_id is None:
+            return
+        if self.current_nickname:
+            self.store.update_combat_power(self.current_nickname, ev.combat_power, entity_id=self.known_oath_id)
+            record_snapshot = dict(self.store.data.get(self.current_nickname, {}))
+        else:
+            pending = self.pending_oath.setdefault(self.known_oath_id, {})
+            pending["combat_power"] = ev.combat_power
+            pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            record_snapshot = {"entity_id": self.known_oath_id, "nickname": None, **pending}
+        self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
     def _on_unknown(self, opcode, packet, arrived_at):
         self.status_queue.put(f"[debug] 알 수 없는 opcode {opcode} 프레임 수신 (len={len(packet)})")
@@ -327,6 +418,44 @@ class LiveCapture:
         self._stop.set()
 
 
+def _npcap_installed():
+    """레지스트리에서 Npcap 드라이버 설치 여부를 확인한다 (Windows 전용).
+    2026-07-08 추가: 개발자가 아닌 사람에게 exe만 공유했을 때, Npcap이 없으면 캡처가
+    조용히 아무것도 안 잡히는 것보다는 미리 명확하게 안내하는 게 낫다. 무료 Npcap은
+    라이선스상 재배포(설치파일을 우리 exe/설치 프로그램에 끼워넣는 것)가 금지되어 있어서
+    (5대까지만 무료, Nmap/Wireshark/Defender for Identity와 함께 쓰는 경우만 예외) - 자동
+    설치는 못 시키고, "감지 후 안내"까지만 한다.
+    """
+    if sys.platform != "win32":
+        return True  # Windows가 아니면 이 검사 자체가 의미 없음 (개발 중 다른 OS 테스트 대비)
+    import winreg
+    for hive_path in (r"SOFTWARE\WOW6432Node\Npcap", r"SOFTWARE\Npcap"):
+        try:
+            winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, hive_path)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def _warn_npcap_missing_gui():
+    import tkinter as tk
+    from tkinter import messagebox
+    import webbrowser
+    tmp_root = tk.Tk()
+    tmp_root.withdraw()
+    open_page = messagebox.askyesno(
+        "Npcap 설치 필요",
+        "패킷 캡처에 필요한 Npcap 드라이버가 설치되어 있지 않은 것 같습니다.\n"
+        "설치 없이는 오드에너지 데이터를 잡을 수 없습니다.\n\n"
+        "지금 Npcap 다운로드 페이지를 열까요?\n"
+        "(설치 시 'WinPcap API-compatible Mode' 체크 권장, 설치 후 이 프로그램 재실행)",
+    )
+    if open_page:
+        webbrowser.open("https://npcap.com/#download")
+    tmp_root.destroy()
+
+
 def list_interfaces():
     try:
         from scapy.arch.windows import get_windows_if_list
@@ -355,16 +484,18 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
 
     last_dynamic_holder = {"v": None}
     store = CharacterStore()
-    # OwnNickname 의 entity_id 는 세션마다 바뀌는 작은 임시 id라서 오드에너지의 영속 id 와
+    # OwnNickname 의 entity_id 는 세션마다 바뀌는 작은 임시 id라서 오드에너지의 계정 공용 id 와
     # 직접 매칭이 안 된다 (aion2_core.py 문서 참고). 리플레이 중 확인한 닉네임을 "현재
     # 세션의 닉네임"으로 들고 있다가, 오드에너지 이벤트가 올 때 그 이벤트의 entity_id 에 붙인다.
     current = {"nickname": None, "server": None, "job": None}
-    # 2026-07-07 추가: opcode(0x0C,0x61) 오탐 방지용 - LiveCapture._on_oath_energy 와 동일한 로직
-    # (id 신뢰 검증). 저장소에 이전에 확인된 id가 있으면 그걸로 콜드스타트를 완화한다.
-    known = {"id": store.most_recent_oath_entity_id()}
-    # 2026-07-07 추가: "왼쪽 숫자"(base, 정기 충전분) + "오른쪽 숫자"(dynamic, 누적분) 합산 버그 수정
-    # - LiveCapture._on_oath_energy 와 동일한 로직 (자세한 설명은 그쪽 주석 참고).
-    known["base"] = store.get_known_base(known["id"]) if known["id"] else 0
+    # 2026-07-08: 저장소가 닉네임 키라서, 마지막으로 활동한 캐릭터를 이어받아 콜드스타트를 완화한다
+    # (LiveCapture.__init__ 과 동일한 로직).
+    last_nickname = store.most_recent_character()
+    last_record = store.data.get(last_nickname, {}) if last_nickname else {}
+    known = {"id": last_record.get("entity_id")}
+    known["base"] = last_record.get("oath_energy_base") or 0
+    # 2026-07-08: 닉네임 확인 전 오드에너지/전투력 데이터 임시 보관함 (LiveCapture.pending_oath와 동일).
+    pending_oath = {}
 
     def is_trusted(ev):
         if ev.delta is not None:
@@ -384,6 +515,12 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
         if getattr(ev, "is_snapshot", False):
             known["base"] = getattr(ev, "base", 0) or 0
             dynamic = getattr(ev, "dynamic", ev.new_total)
+            # LiveCapture._on_oath_energy 와 동일한 이유로 리셋 (2026-07-08).
+            current["nickname"] = None
+            current["server"] = None
+            current["job"] = None
+            # GUI의 entity_nickname 캐시도 함께 무효화 (동일 이유, LiveCapture 쪽 주석 참고).
+            event_queue.put(types.SimpleNamespace(forget_entity_id=ev.entity_id))
         else:
             dynamic = ev.new_total
 
@@ -399,14 +536,31 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
             )
 
         known["id"] = ev.entity_id
+
         if current["nickname"]:
-            store.update_nickname(ev.entity_id, current["nickname"], current["server"], current["job"])
-        store.update_oath_energy(ev.entity_id, ev.new_total, ev.delta, base=known["base"], dynamic=dynamic)
-        ev.display_name = store.get_display_name(ev.entity_id)
-        # 라이브 모드와 동일하게, GUI가 저장된 레코드 전체(닉네임/왼쪽·오른쪽/이력)를 볼 수 있게
-        # 스냅샷을 실어 보낸다 (2026-07-08 추가).
-        record = store.data.get(str(ev.entity_id), {})
-        ev.record = {**record, "history": list(record.get("history", []))}
+            store.update_character_info(
+                current["nickname"], entity_id=ev.entity_id,
+                server=current["server"], job=current["job"],
+            )
+            store.update_oath_energy(
+                current["nickname"], ev.new_total, ev.delta,
+                base=known["base"], dynamic=dynamic, entity_id=ev.entity_id,
+            )
+            ev.display_name = current["nickname"]
+            ev.record = dict(store.data.get(current["nickname"], {}))
+        else:
+            pending = pending_oath.setdefault(ev.entity_id, {})
+            pending.update({
+                "oath_energy": ev.new_total,
+                "oath_energy_base": known["base"],
+                "oath_energy_dynamic": dynamic,
+                "last_delta": ev.delta,
+                "last_updated": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+            ev.display_name = f"캐릭터(id={ev.entity_id})"
+            ev.record = {"entity_id": ev.entity_id, "nickname": None, **pending}
+
+        ev.nickname_confirmed = False
         event_queue.put(ev)
 
     def on_nickname(ev):
@@ -415,8 +569,38 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
         current["job"] = ev.job
         status_queue.put(f"캐릭터 닉네임 확인: {ev.nickname}")
 
+        if known["id"] is not None:
+            store.update_character_info(
+                ev.nickname, entity_id=known["id"], server=ev.server, job=ev.job,
+            )
+            pending = pending_oath.pop(known["id"], None)
+            if pending:
+                store.update_oath_energy(
+                    ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
+                    base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
+                    entity_id=known["id"],
+                )
+                if pending.get("combat_power") is not None:
+                    store.update_combat_power(ev.nickname, pending["combat_power"], entity_id=known["id"])
+            record_snapshot = dict(store.data.get(ev.nickname, {}))
+            event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
+
+    def on_combat_power(ev):
+        if known["id"] is None:
+            return
+        if current["nickname"]:
+            store.update_combat_power(current["nickname"], ev.combat_power, entity_id=known["id"])
+            record_snapshot = dict(store.data.get(current["nickname"], {}))
+        else:
+            pending = pending_oath.setdefault(known["id"], {})
+            pending["combat_power"] = ev.combat_power
+            pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+            record_snapshot = {"entity_id": known["id"], "nickname": None, **pending}
+        event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+
     proc = StreamProcessor(on_oath_energy=on_oath, on_nickname=on_nickname,
-                            get_known_oath_id=lambda: known["id"])
+                            get_known_oath_id=lambda: known["id"],
+                            on_combat_power=on_combat_power)
     assembler = StreamAssembler(proc)
     live = LiveTcpReassembler(assembler)
 
@@ -452,20 +636,34 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
 # GUI (Tkinter) - 대시보드와 같은 내용(닉네임/총량/왼쪽·오른쪽/최근 이력)을 창 안에서 바로 표시
 # ---------------------------------------------------------------------------
 
-def _fmt_history_entry(h):
-    ts = h.get("timestamp") or ""
-    t = ts[11:19] if len(ts) >= 19 else ts  # "YYYY-MM-DDTHH:MM:SS" -> "HH:MM:SS"
-    delta = h.get("delta")
-    if delta is None:
-        delta_text = "최초"
-    else:
-        delta_text = f"+{delta}" if delta >= 0 else str(delta)
-    total = h.get("oath_energy")
-    return f"{t}   {delta_text:>6}   → {total}"
+def _fmt_info_cell(total, delta):
+    """현황 표의 "오드 정보" 칸: 총량만 보여준다 (2026-07-08 - 사용자 요청으로 변화량(delta)
+    표시는 제거함. delta 파라미터는 호출부 호환을 위해 남겨두되 더는 사용하지 않는다)."""
+    return f"{total}"
+
+
+def _fmt_date_cell(ts):
+    """현황 표의 "갱신날짜" 칸: ISO8601("...T...") 을 보기 좋게 공백으로 바꾼다."""
+    if not ts:
+        return ""
+    return ts.replace("T", " ")
+
+
+def _fmt_combat_power_cell(value):
+    """현황 표의 "전투력" 칸: 게임 UI와 같은 "345.6K" 형태로 표시 (2026-07-08 추가)."""
+    if value is None:
+        return "-"
+    if value >= 1000:
+        return f"{value / 1000:.1f}K"
+    return str(value)
+
+
+STATUS_ROW_CAP = 100  # 표에 유지할 최대 캐릭터 수 (그 이상이면 가장 오래 안 갱신된 것부터 정리)
 
 
 def run_gui(event_queue, status_queue):
     import tkinter as tk
+    from tkinter import ttk
 
     BG = "#101010"
     FG_DIM = "#888888"
@@ -479,18 +677,14 @@ def run_gui(event_queue, status_queue):
     root.minsize(360, 360)
     root.configure(bg=BG)
 
-    nickname_var = tk.StringVar(value="캐릭터 확인 중...")
     value_var = tk.StringVar(value="대기 중...")
     delta_var = tk.StringVar(value="아이템을 사용하거나 캐릭터로 접속하면 표시됩니다")
     breakdown_var = tk.StringVar(value="")
     updated_var = tk.StringVar(value="")
     status_var = tk.StringVar(value="")
 
-    tk.Label(root, textvariable=nickname_var, font=("Segoe UI", 14, "bold"),
-              fg=FG_LABEL, bg=BG).pack(pady=(14, 0))
-
     tk.Label(root, textvariable=value_var, font=("Segoe UI", 34, "bold"),
-              fg=ACCENT, bg=BG).pack(pady=(4, 0))
+              fg=ACCENT, bg=BG).pack(pady=(16, 0))
 
     tk.Label(root, textvariable=delta_var, font=("Segoe UI", 11),
               fg=FG_DIM, bg=BG).pack(pady=(0, 4))
@@ -501,22 +695,39 @@ def run_gui(event_queue, status_queue):
     tk.Label(root, textvariable=updated_var, font=("Segoe UI", 9),
               fg=FG_DIM, bg=BG).pack(pady=(0, 8))
 
-    tk.Label(root, text="최근 변경 이력", font=("Segoe UI", 10, "bold"),
+    tk.Label(root, text="캐릭터 현황", font=("Segoe UI", 10, "bold"),
               fg=FG_LABEL, bg=BG).pack(anchor="w", padx=16)
+
+    # 다크 테마에 맞춘 표(Treeview) 스타일 - 기본 ttk 테마는 배경색 지정이 안 먹혀서
+    # "clam" 테마로 바꾼 뒤 색을 직접 지정한다.
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("Dark.Treeview", background="#181818", fieldbackground="#181818",
+                     foreground="#DDDDDD", rowheight=22, borderwidth=0)
+    style.configure("Dark.Treeview.Heading", background="#262626", foreground=FG_LABEL,
+                     borderwidth=0, relief="flat")
+    style.map("Dark.Treeview", background=[("selected", "#333333")])
 
     hist_frame = tk.Frame(root, bg=BG)
     hist_frame.pack(fill="both", expand=True, padx=16, pady=(2, 8))
 
-    hist_scroll = tk.Scrollbar(hist_frame)
+    hist_scroll = ttk.Scrollbar(hist_frame, orient="vertical")
     hist_scroll.pack(side="right", fill="y")
 
-    hist_list = tk.Listbox(
-        hist_frame, font=("Consolas", 10), bg="#181818", fg="#DDDDDD",
-        selectbackground="#333333", borderwidth=0, highlightthickness=0,
-        yscrollcommand=hist_scroll.set,
+    hist_tree = ttk.Treeview(
+        hist_frame, columns=("nickname", "info", "combat_power", "updated"), show="headings",
+        yscrollcommand=hist_scroll.set, style="Dark.Treeview",
     )
-    hist_list.pack(side="left", fill="both", expand=True)
-    hist_scroll.config(command=hist_list.yview)
+    hist_tree.heading("nickname", text="닉네임")
+    hist_tree.heading("info", text="오드 정보")
+    hist_tree.heading("combat_power", text="전투력")
+    hist_tree.heading("updated", text="갱신날짜")
+    hist_tree.column("nickname", width=80, anchor="w")
+    hist_tree.column("info", width=110, anchor="w")
+    hist_tree.column("combat_power", width=80, anchor="w")
+    hist_tree.column("updated", width=140, anchor="w")
+    hist_tree.pack(side="left", fill="both", expand=True)
+    hist_scroll.config(command=hist_tree.yview)
 
     status_label = tk.Label(
         root, textvariable=status_var, font=("Segoe UI", 9),
@@ -524,19 +735,89 @@ def run_gui(event_queue, status_queue):
     )
     status_label.pack(pady=(0, 10), padx=16, fill="x")
 
-    def render_record(record):
-        """record: oath_energy_data.json 의 캐릭터 레코드 하나(dict). 대시보드(index.html)의
-        renderCard()와 같은 필드를 같은 방식으로 보여준다 - 화면이 서로 다를 뿐 내용은 동일해야 함."""
-        entity_id = record.get("entity_id")
-        nickname_var.set(record.get("nickname") or f"캐릭터(id={entity_id})")
+    # 표 행은 닉네임으로 식별한다 (2026-07-08). entity_id는 계정/슬롯 단위로 재사용되므로
+    # entity_id로 행을 구분하면 다른 캐릭터로 접속해도 새 행이 안 생기고 기존 행이 그 캐릭터
+    # 데이터로 덮어써지는 문제가 있었음.
+    row_by_nickname = {}  # nickname -> treeview row id
 
+    # entity_id -> 그 entity_id로 마지막으로 확인된 닉네임 (이번 GUI 세션 내 캐시). 닉네임 없는
+    # 패킷이 왔을 때 "지금 이 entity_id가 어느 캐릭터를 가리키고 있는지" 알아내는 데 쓴다.
+    entity_nickname = {}
+
+    # entity_id -> 그 entity_id로 아직 닉네임을 한 번도 못 받은 상태에서 들어온 레코드 임시 보관함.
+    pending_records = {}
+
+    def _remove_row(iid):
+        for nick, v in list(row_by_nickname.items()):
+            if v == iid:
+                del row_by_nickname[nick]
+        hist_tree.delete(iid)
+
+    def upsert_status_row(record, nickname_confirmed=False):
+        """캐릭터 현황 표 갱신. 행은 닉네임 기준(row_by_nickname)이고, entity_id는 "닉네임
+        없는 패킷이 왔을 때 어느 캐릭터 것인지" 찾는 보조 키(entity_nickname)로만 쓴다.
+
+        record["nickname"]이 아니라 호출부가 명시적으로 넘겨주는 nickname_confirmed(이 이벤트가
+        실제 OwnNickname 패킷에서 온 것인지)만 보고 판단한다 - record는 이제 저장소가 닉네임
+        확정 전에는 아예 쓰지 않으므로 nickname 필드가 항상 정확하지만(2026-07-08 저장소 재구성),
+        그래도 이 GUI 레벨의 이중 방어는 유지한다.
+        """
+        entity_id = record.get("entity_id")
+        if entity_id is None:
+            return
+
+        if nickname_confirmed:
+            nickname = record.get("nickname")
+            if not nickname:
+                return
+            entity_nickname[entity_id] = nickname
+
+            pending = pending_records.pop(entity_id, None)
+            merged = {**pending, **record} if pending else record
+
+            values = (
+                nickname,
+                _fmt_info_cell(merged.get("oath_energy"), merged.get("last_delta")),
+                _fmt_combat_power_cell(merged.get("combat_power")),
+                _fmt_date_cell(merged.get("last_updated")),
+            )
+            iid = row_by_nickname.get(nickname)
+            if iid is not None and hist_tree.exists(iid):
+                hist_tree.item(iid, values=values)
+                hist_tree.move(iid, "", 0)  # 방금 갱신된 캐릭터를 맨 위로
+            else:
+                new_iid = hist_tree.insert("", 0, values=values)
+                row_by_nickname[nickname] = new_iid
+                children = hist_tree.get_children()
+                if len(children) > STATUS_ROW_CAP:
+                    for old_id in children[STATUS_ROW_CAP:]:
+                        _remove_row(old_id)
+            return
+
+        known_nick = entity_nickname.get(entity_id)
+        iid = row_by_nickname.get(known_nick) if known_nick else None
+        if known_nick is None or iid is None or not hist_tree.exists(iid):
+            pending_records[entity_id] = record
+            return
+        values = (
+            known_nick,
+            _fmt_info_cell(record.get("oath_energy"), record.get("last_delta")),
+            _fmt_combat_power_cell(record.get("combat_power")),
+            _fmt_date_cell(record.get("last_updated")),
+        )
+        hist_tree.item(iid, values=values)
+        hist_tree.move(iid, "", 0)
+
+    def render_summary(record):
+        """record: oath_energy_data.json 의 캐릭터 레코드 하나(dict). 화면 상단(총량/분리/
+        마지막 갱신)만 갱신한다 - 표(캐릭터 현황)는 upsert_status_row 가 별도로 관리한다."""
         total = record.get("oath_energy")
         value_var.set(f"오드에너지 {total}" if total is not None else "대기 중...")
 
         base = record.get("oath_energy_base")
         dynamic = record.get("oath_energy_dynamic")
         if base is not None and dynamic is not None:
-            breakdown_var.set(f"왼쪽 {base} + 오른쪽 {dynamic} = {base + dynamic}")
+            breakdown_var.set(f"기본 {base} + 추가 {dynamic} = {base + dynamic}")
         else:
             breakdown_var.set("왼쪽/오른쪽 값 아직 확인 안 됨")
 
@@ -550,22 +831,19 @@ def run_gui(event_queue, status_queue):
             sign = "+" if last_delta >= 0 else ""
             delta_var.set(f"{sign}{last_delta}")
 
-        hist_list.delete(0, tk.END)
-        history = record.get("history") or []
-        for h in reversed(history):  # 최신이 위로
-            hist_list.insert(tk.END, _fmt_history_entry(h))
-        if not history:
-            hist_list.insert(tk.END, "  (기록 없음)")
-
     # 시작하자마자 "대기" 상태로 텅 비어 보이지 않도록, 이전 실행에서 이미 저장된
-    # oath_energy_data.json 내용으로 초기 화면을 채운다 (2026-07-08 추가 - 사용자 요청:
-    # "화면에서 데이터 저장된 현황을 보여주도록 해야해"). 새 이벤트가 오기 전까지는
-    # 이 스냅샷이 그대로 유지된다.
+    # oath_energy_data.json 내용으로 초기 화면을 채운다. 표는 캐릭터당 한 행(현황)이므로,
+    # 저장된 모든 캐릭터를 last_updated 오래된 순으로 upsert 해서 최신이 맨 위로 오게 한다.
     try:
         initial_store = CharacterStore()
-        initial_id = initial_store.most_recent_oath_entity_id()
-        if initial_id is not None:
-            render_record(initial_store.data.get(str(initial_id), {}))
+        initial_nickname = initial_store.most_recent_character()
+        if initial_nickname is not None:
+            render_summary(initial_store.data.get(initial_nickname, {}))
+
+        records = list(initial_store.data.values())
+        records.sort(key=lambda r: r.get("last_updated") or "")  # 오래된 것부터
+        for rec in records:
+            upsert_status_row(rec, nickname_confirmed=True)
     except Exception:
         pass  # 저장 파일이 없거나 읽기 실패해도 GUI 자체는 정상적으로 뜨도록 조용히 무시
 
@@ -573,9 +851,17 @@ def run_gui(event_queue, status_queue):
         try:
             while True:
                 ev = event_queue.get_nowait()
+
+                forget_id = getattr(ev, "forget_entity_id", None)
+                if forget_id is not None:
+                    entity_nickname.pop(forget_id, None)
+                    continue
+
                 record = getattr(ev, "record", None)
                 if record:
-                    render_record(record)
+                    render_summary(record)
+                    nickname_confirmed = getattr(ev, "nickname_confirmed", False)
+                    upsert_status_row(record, nickname_confirmed)
                 else:
                     # record 스냅샷이 없는 예외적인 경우를 위한 최소한의 폴백
                     value_var.set(f"오드에너지 {ev.new_total}")
@@ -643,6 +929,15 @@ def main():
         )
         t.start()
     else:
+        if not _npcap_installed():
+            status_queue.put(
+                "[안내] Npcap이 설치되어 있지 않은 것 같습니다. https://npcap.com 에서 설치 후 재실행하세요."
+            )
+            if not args.no_gui:
+                try:
+                    _warn_npcap_missing_gui()
+                except Exception:
+                    pass  # 감지가 틀렸을 수도 있으니(레지스트리 경로가 다른 경우 등) 조용히 무시하고 계속 진행
         capture = LiveCapture(server_net, args.port, event_queue, status_queue,
                                iface=args.iface, debug=args.debug)
         capture.start()

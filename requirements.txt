@@ -1,0 +1,3 @@
+scapy
+lz4
+pyinstaller

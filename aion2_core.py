@@ -23,6 +23,7 @@ import lz4.block
 OATH_ENERGY_OPCODE = (0x0C, 0x61)
 OWN_NICKNAME_OPCODE = (0x33, 0x36)  # 참고: TK-open-public/Aion2-Dps-Meter PropertyHandler.kt searchOwnNickname
 OWN_STATS_SNAPSHOT_OPCODE = (0x0B, 0x61)  # 로그인/월드 진입 시 1회 오는 "전체 스탯 동기화" 패킷
+COMBAT_POWER_OPCODE = (0x56, 0x36)  # 전투력 갱신 패킷 (2026-07-08, "전투력 변화 캡쳐.pcapng"로 확인)
 
 
 class VarInt:
@@ -73,12 +74,19 @@ def _is_plausible_oath_energy(value):
     opcode (0x0C,0x61)/(0x0B,0x61) 이 다른 종류의 패킷에 재사용되는 경우
     (실제로 OwnNickname opcode(0x33,0x36)가 다른 용도로도 쓰이는 걸 이미 한 번 확인한 바 있음),
     구조 자체는 그럴듯해 보여도 실제로는 오드에너지가 아닌 엉뚱한 값을 파싱하게 된다.
-    지금까지 확인된 모든 실제값은 1000~1700대였고 0이었던 적은 한 번도 없었음 - 0 또는 음수는
-    "이 패킷엔 오드에너지 정보가 없는데 구조가 우연히 맞아떨어져서 0으로 찍힌" 오파싱일 가능성이
-    거의 확실하다고 보고 걸러낸다. 위쪽 한도는 varint 오독으로 나올 수 있는 터무니없이 큰 값만
-    걸러내는 넉넉한 안전판(실제 최대치를 모르므로 낮게 잡지 않음).
+
+    **정정 (2026-07-08): 0을 걸러내면 안 된다.** 원래는 "지금까지 확인된 모든 실제값은
+    1000~1700대였고 0이었던 적은 한 번도 없었다"는 관찰을 근거로 `0 < value`로 0을 걸러냈는데,
+    이건 표본이 적어서 생긴 잘못된 가정이었다 - 캐릭터 "활성성"은 왼쪽 숫자(base)가 원래 0이고
+    오른쪽 숫자(dynamic)도 다 써서 총 오드에너지가 진짜 0인 상태가 있는데, 이 경우 접속 시
+    로그인 스냅샷(parse_own_stats_snapshot_payload)의 total(=0)이 여기서 걸러지면서 오드에너지
+    갱신 자체가 아예 인식되지 않는 버그가 있었다 (사용자 실측: "활성성만 캐릭터 접속할때
+    오드에너지 갱신이 안되는데... 수치가 0이면 인식을 못하는거 같기도하고"). 그래서 이제 0은
+    허용하고, 음수(varint 오독/구조 불일치로만 나올 수 있음)만 걸러낸다. 위쪽 한도는 varint
+    오독으로 나올 수 있는 터무니없이 큰 값만 걸러내는 넉넉한 안전판(실제 최대치를 모르므로 낮게
+    잡지 않음).
     """
-    return 0 < value <= 50_000_000
+    return 0 <= value <= 50_000_000
 
 
 def parse_oath_energy_payload(payload: bytes):
@@ -169,19 +177,29 @@ def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):
     따로 저장해뒀다가, 이후 오는 opcode(0x0C,0x61) 변경 이벤트(값 1개만 옴 = 그 누적분(v2)만 갱신하는
     것으로 추정)의 값과 다시 합산해서 진짜 총량을 계산하는 데 쓴다.
 
-    `00 08 01` 은 흔한 3바이트 마커라 여러 곳에서 우연히 일치할 수 있으므로 더 이상 사용하지 않는다.
-    대신 `0c 01` (tag+field_id, 2바이트) 뒤에 [varint entity_id][varint v1][varint v2] 가 이어지는
-    후보를 전부 모으고, 합계(v1+v2)가 그럴듯한 값(_is_plausible_oath_energy)인 것만 채택 후보로 남긴다.
-    `known_id`(호출측이 "이전에 확인된 진짜 오드에너지 entity_id"를 알고 있으면 넘겨주는 값)와 일치하는
-    후보가 있으면 그걸 우선 채택하고, 없으면(예: 콜드스타트) 첫 번째 그럴듯한 후보를 채택한다 - 이 경우
-    콜백측의 2차 신뢰 검증(aion2_live_monitor.py)에서 한 번 더 걸러질 수 있다. 그럴듯한 후보가 하나도
-    없으면 None 을 반환해 "이 패킷엔 오드에너지 정보가 없다"고 정직하게 실패한다 (기존 폴백 동작 유지).
+    **정정 (2026-07-08, 실제 "활성성 접속.pcapng" 캡처로 확인): `00 08 01` 단일값 형태도 여전히
+    실제로 쓰인다 - 완전히 폐기된 게 아니었다.** 위 문단은 "우연한 오탐이었을 것"이라고 결론 냈었지만,
+    활성성이 실제로 접속하는 캡처를 받아 바이트 단위로 뜯어보니 이 캐릭터의 로그인 스냅샷 field_id=1
+    레코드는 `0c 01`(2값) 형태가 **아예 없고**, `00 08 01`+[varint entity_id][varint total] 단일값
+    형태 **하나만** 정확히 한 번(entity_id=51591, total=780) 나타났다. 즉 "왼쪽 숫자(base)가 0인
+    캐릭터는 서버가 필드 자체를 단일값 형태로 보낸다"는 게 실제 프로토콜 동작인 것으로 보인다 - 이게
+    바로 예전에 "활성성은 우연히 값 1개짜리 방식으로도 맞아떨어졌다"고 잘못 해석했던 현상의 진짜 원인.
+    그래서 이제 `0c 01`(2값, base+dynamic) 검색과 `00 08 01`(1값, base=0 암묵적) 검색을 **둘 다** 하고
+    두 결과를 합쳐서 후보로 삼는다. `known_id`와 일치하는 후보가 있으면 그걸 우선 채택하고, 없으면
+    (콜드스타트) 처음 찾은 후보를 채택한다 - 이 경우 콜백측의 2차 신뢰 검증(aion2_live_monitor.py)에서
+    한 번 더 걸러질 수 있다. 후보가 하나도 없으면 None 을 반환해 "이 패킷엔 오드에너지 정보가 없다"고
+    정직하게 실패한다 (기존 폴백 동작 유지). `00 08 01`은 흔한 3바이트열이라 오탐 가능성이 여전히
+    있으므로, 이 형태로 찾은 후보는 known_id와 일치할 때만 신뢰하도록 호출측에서 추가 검증하는 게
+    안전하다 (aion2_live_monitor.py의 `_is_trusted_oath_event`가 이미 델타 없는 이벤트에 대해 이
+    역할을 하고 있음 - 로그인 스냅샷은 delta=None 이라 그 검증을 그대로 통과함).
     """
-    marker = b"\x0c\x01"
     candidates = []
+
+    # (1) 2값 형태: base(v1) + dynamic(v2), 둘 다 varint로 명시됨
+    marker_double = b"\x0c\x01"
     search_start = 0
     while True:
-        idx = payload.find(marker, search_start)
+        idx = payload.find(marker_double, search_start)
         if idx == -1:
             break
         pos = idx + 2
@@ -196,6 +214,24 @@ def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):
                     total = v1.value + v2.value
                     if _is_plausible_oath_energy(total):
                         candidates.append((id_vi.value, v1.value, v2.value, total))
+        search_start = idx + 1
+
+    # (2) 1값 형태: base가 0이라 서버가 그냥 생략하고 total(=dynamic) 하나만 보낸 경우
+    #     (2026-07-08 추가, 활성성 실제 캡처로 확인 - 위 docstring 정정 참고)
+    marker_single = b"\x00\x08\x01"
+    search_start = 0
+    while True:
+        idx = payload.find(marker_single, search_start)
+        if idx == -1:
+            break
+        pos = idx + 3
+        id_vi = read_varint(payload, pos)
+        if id_vi.length > 0:
+            pos2 = pos + id_vi.length
+            total_vi = read_varint(payload, pos2)
+            if total_vi.length > 0:
+                if _is_plausible_oath_energy(total_vi.value):
+                    candidates.append((id_vi.value, 0, total_vi.value, total_vi.value))
         search_start = idx + 1
 
     if not candidates:
@@ -216,6 +252,40 @@ def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):
     ev.base = base
     ev.dynamic = dynamic
     return ev
+
+
+class CombatPowerEvent:
+    def __init__(self, combat_power, raw_packet, arrived_at=None):
+        self.combat_power = combat_power
+        self.raw_packet = raw_packet
+        self.arrived_at = arrived_at
+
+    def __repr__(self):
+        return f"<CombatPower {self.combat_power}>"
+
+
+def parse_combat_power_payload(payload: bytes):
+    """opcode(0x56,0x36) 전투력 갱신 패킷 파싱.
+
+    **구조 (2026-07-08, "전투력 변화 캡쳐.pcapng"로 확인):** payload 는 정확히 16바이트,
+    8바이트 LE 정수 2개로 구성됨 - `[전투력(8바이트 LE)][?(8바이트 LE)]`. 값이 항상
+    32비트 범위 안이라 상위 4바이트는 늘 0으로 관측됨(4바이트 LE로 읽어도 같은 값).
+
+    앞쪽 8바이트가 "본인 전투력"임을 사용자가 직접 확인: 같은 장비 하나를 뺐다 꼈다 4번
+    반복하는 캡처에서, 앞쪽 값만 331622 -> 331022 -> 345022 -> 345622 로 바뀌는 게 관측됐고
+    (장비 탈부착에 반응해서 실시간으로 재계산됨), 뒤쪽 8바이트는 캡처 내내 345622 로 고정이었음
+    (전투력과 무관한 다른 필드로 추정, 아직 의미 미상 - 무시).
+
+    이 패킷엔 entity_id 필드가 없음 - 오드에너지 opcode(0x0C,0x61)와 달리 항상 "본인" 것으로
+    간주하고, 호출측(aion2_live_monitor.py)이 현재 추적 중인 오드에너지 entity_id에 붙여서
+    저장한다 (닉네임 처리와 동일한 패턴).
+    """
+    if len(payload) != 16:
+        return None
+    value = struct.unpack_from("<Q", payload, 0)[0]
+    if not (0 < value <= 2_000_000_000):  # 전투력이 20억을 넘을 일은 없다고 보고 넉넉히 잡은 안전판
+        return None
+    return CombatPowerEvent(value, payload)
 
 
 class NicknameEvent:
@@ -320,10 +390,12 @@ class StreamProcessor:
     오드에너지 opcode 를 만나면 on_oath_energy 콜백을 호출한다.
     """
 
-    def __init__(self, on_oath_energy=None, on_nickname=None, on_unknown=None, get_known_oath_id=None):
+    def __init__(self, on_oath_energy=None, on_nickname=None, on_unknown=None, get_known_oath_id=None,
+                 on_combat_power=None):
         self.on_oath_energy = on_oath_energy
         self.on_nickname = on_nickname
         self.on_unknown = on_unknown
+        self.on_combat_power = on_combat_power  # 2026-07-08 추가: 전투력 갱신 콜백
         # 2026-07-07 추가: 로그인 스냅샷(0x0B,0x61) 파싱 시 "이전에 확인된 진짜 오드에너지 entity_id"를
         # 물어보기 위한 콜백 (parse_own_stats_snapshot_payload 의 known_id 힌트로 전달됨).
         self.get_known_oath_id = get_known_oath_id
@@ -385,6 +457,14 @@ class StreamProcessor:
                 snap_ev.arrived_at = arrived_at
                 if self.on_oath_energy:
                     self.on_oath_energy(snap_ev)
+            elif self.on_unknown:
+                self.on_unknown((b1, b2), packet, arrived_at)
+        elif (b1, b2) == COMBAT_POWER_OPCODE:
+            cp_ev = parse_combat_power_payload(payload)
+            if cp_ev is not None:
+                cp_ev.arrived_at = arrived_at
+                if self.on_combat_power:
+                    self.on_combat_power(cp_ev)
             elif self.on_unknown:
                 self.on_unknown((b1, b2), packet, arrived_at)
         elif self.on_unknown:

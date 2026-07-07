@@ -1,0 +1,54 @@
+{
+  "활성성": {
+    "nickname": "활성성",
+    "entity_id": 51591,
+    "server": 1002,
+    "job": 14,
+    "oath_energy": 790,
+    "oath_energy_base": 0,
+    "oath_energy_dynamic": 790,
+    "last_delta": null,
+    "last_updated": "2026-07-08T03:36:09",
+    "combat_power": 773369,
+    "combat_power_updated": "2026-07-08T03:36:09"
+  },
+  "궁예성": {
+    "nickname": "궁예성",
+    "entity_id": 51591,
+    "server": 1002,
+    "job": 14,
+    "oath_energy": 295,
+    "oath_energy_base": 270,
+    "oath_energy_dynamic": 25,
+    "last_delta": -765,
+    "last_updated": "2026-07-08T03:36:27",
+    "combat_power": 275433,
+    "combat_power_updated": "2026-07-08T03:36:27"
+  },
+  "긴검성": {
+    "nickname": "긴검성",
+    "entity_id": 51591,
+    "server": 1002,
+    "job": 6,
+    "oath_energy": 320,
+    "oath_energy_base": 285,
+    "oath_energy_dynamic": 35,
+    "last_delta": 10,
+    "last_updated": "2026-07-08T03:39:46",
+    "combat_power": 249808,
+    "combat_power_updated": "2026-07-08T03:39:46"
+  },
+  "쌍검성": {
+    "nickname": "쌍검성",
+    "entity_id": 51591,
+    "server": 1002,
+    "job": 18,
+    "oath_energy": 330,
+    "oath_energy_base": 255,
+    "oath_energy_dynamic": 75,
+    "last_delta": 40,
+    "last_updated": "2026-07-08T03:41:27",
+    "combat_power": 404618,
+    "combat_power_updated": "2026-07-08T03:41:27"
+  }
+}
