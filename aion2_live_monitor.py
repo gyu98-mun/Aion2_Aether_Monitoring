@@ -79,6 +79,32 @@ if getattr(sys, "frozen", False) and (sys.stdout is None or sys.stderr is None):
 DEFAULT_SERVER_NET = "206.127.156.0/24"
 DEFAULT_PORT = 13328
 
+# 2026-07-09 추가(열두 번째 버그 수정): 로그인 스냅샷 직후 전투력이 몇 번 연속으로 요동치다가
+# 마지막 값에 정착하는 짧은 버스트가 실측으로 확인됨 - 사용자가 업로드한
+# "살성전투력 받아오는 패킷 점검용 (전투력 404.6K).pcapng" 리플레이 분석 결과, 스냅샷 -1.43초에
+# 도착한 값(240725)은 남이었고, 스냅샷 +0.44초 이내에 도착한 마지막 값(404618)이 사용자가
+# 게임 화면에서 직접 확인한 진짜 값(파일명 "404.6K")이었다. 이 유예 시간(초) 이내에 스냅샷
+# 이후 도착하는 전투력은 닉네임이 아직 미확인이어도 신뢰한다 - 그 시간을 벗어나면(닉네임 확인까지
+# 보통 5~6초 걸림) 열 번째 버그에서 확인된 캐릭터선택 화면 미리보기 노이즈와 구분이 안 되므로
+# 기존처럼 무시한다.
+# 2026-07-09 재조정: 실측된 버스트는 스냅샷 후 0.44초 이내에 끝났다. 처음엔 여유를 넉넉히
+# 두고 1.0초로 잡았었는데, 사용자가 "닉네임 없는 값을 허용하면 오드가 또 망가질 수 있지
+# 않냐"고 정확히 지적함 - 이 창이 넓을수록 열 번째 버그의 미리보기 노이즈(닉네임 확인까지
+# 5~6초 동안 아무 때나 올 수 있음)를 잘못 받아들일 여지가 커진다. 그래서 실측값(0.44초)에
+# 여유를 조금만 두고 0.6초로 좁힌다 - 관찰된 버스트는 여전히 확실히 덮으면서, 창을 최대한
+# 좁게 유지해 노이즈가 섞여 들어올 시간을 줄인다.
+COMBAT_POWER_SNAPSHOT_GRACE = 0.6
+
+# 2026-07-09 추가(배포 전 마무리): 캐릭터 전환 직전(스냅샷이 뜨기 몇백 ms 전) 다음 캐릭터의
+# 전투력 패킷이 아직 안 리셋된 current_nickname(이전 캐릭터) 아래로 화면에 잠깐 잘못 찍히는
+# 게 실측됨 - 저장소에는 안 남지만(다음 스냅샷이 pending_oath를 통째로 비움) 콘솔/GUI에는
+# 이전 캐릭터 이름으로 엉뚱한 값이 순간적으로 보인다. 배포 전 마무리 단계라 이 표시 잔상도
+# 없애기로 함(사용자 확인: "지금은 거의 완성단계라 해결하고 배포하는게 맞을것 같아"). 값을
+# 즉시 화면에 반영하지 않고 이 시간(초)만큼 늦춰서 내보내고, 그 사이에 캐릭터 전환이 감지되면
+# (아래 _switch_epoch 참고) 아예 내보내지 않는다 - 정상적인(전환 없는) 상황에서는 사람이
+# 체감하기 힘든 짧은 지연이라 실시간성에 미치는 영향은 거의 없다.
+COMBAT_POWER_DISPLAY_DEBOUNCE = 0.4
+
 
 def parse_network(spec):
     """'206.127.156.142' 같은 단일 IP 나 '206.127.156.0/24' 같은 대역 모두 허용."""
@@ -167,7 +193,11 @@ class LiveCapture:
         # 뿐, 실제로 이 캐릭터가 이번 세션에도 접속했는지는 아래에서 확인되는 닉네임으로 재검증된다.
         last_nickname = self.store.most_recent_character()
         last_record = self.store.data.get(last_nickname, {}) if last_nickname else {}
-        self.known_oath_id = last_record.get("entity_id")
+        _last_id = last_record.get("entity_id")
+        # 2026-07-09: 예전 버그로 이미 entity_id=0이 저장돼버린 JSON을 이어받으면, 여기서 그대로
+        # known_oath_id=0으로 시작해버려서 코드를 고쳐도 다음 실행부터 계속 재발한다(0을 절대
+        # 신뢰하지 않는 이유는 _is_trusted_oath_event 주석 참고). 0이면 모르는 상태(None)로 시작.
+        self.known_oath_id = _last_id if _last_id != 0 else None
         self.known_base = last_record.get("oath_energy_base") or 0
 
         self._build_pipeline()
@@ -198,6 +228,14 @@ class LiveCapture:
         # "닉네임이 확정된 데이터만 받는다"는 계약을 지켜서, entity_id가 계정 공용이라 생기는
         # "엉뚱한 캐릭터 이름 아래 데이터가 쓰이는" 문제를 구조적으로 막는다.
         self.pending_oath = {}
+        # 2026-07-09 추가(열두 번째 버그 수정): 로그인 스냅샷 시각 + COMBAT_POWER_SNAPSHOT_GRACE
+        # 까지는 닉네임 미확인이어도 전투력을 신뢰하는 유예 시각. is_snapshot 처리 때마다 갱신됨.
+        self.combat_power_grace_until = None
+        # 2026-07-09 추가(배포 전 마무리): 캐릭터 전환(is_snapshot)이 감지될 때마다 1씩 증가하는
+        # 세대 번호. _on_combat_power가 "현재 캐릭터" 이름으로 화면 표시를 예약할 때 이 값을 같이
+        # 찍어두고, 예약된 시간이 되어 실제로 내보낼 때 세대 번호가 그대로인지 확인한다 - 그 사이에
+        # 전환이 감지됐으면(세대 번호가 바뀌었으면) 이미 낡은 값이므로 조용히 버린다.
+        self._switch_epoch = 0
 
     def _on_oath_energy(self, ev):
         # 2026-07-07 추가: id 신뢰 검증. delta 필드가 있는 "증가" 타입은 total/delta 두 값이
@@ -232,8 +270,41 @@ class LiveCapture:
             # 데이터로 잘못 덮어써진다(저장소는 정상이어도 화면만 오염됨). forget_entity_id
             # 이벤트로 GUI 쪽 캐시도 함께 무효화한다.
             self.event_queue.put(types.SimpleNamespace(forget_entity_id=ev.entity_id))
+            # 2026-07-09 추가(배포 전 마무리): 전환이 감지된 순간 세대 번호를 올려서, 이 시점
+            # 이전에 "이전 캐릭터" 이름으로 예약돼있던 전투력 화면 표시를 전부 무효화한다.
+            self._switch_epoch += 1
+            # 2026-07-08 수정(열한 번째 버그, 실측): entity_id가 계정 공용이라
+            # pending_oath[entity_id]는 여러 캐릭터에 걸쳐 재사용되는 딕셔너리다. 위에서
+            # current_nickname은 리셋했지만 pending_oath 자체는 지운 적이 없어서, 직전
+            # 캐릭터가 활동 중일 때 미처 플러시되지 못한 채 남아있던 combat_power(예:
+            # 이전 캐릭터의 전투력, 또는 아직 신뢰 못 하는 캐릭터선택 미리보기 잔재)가
+            # 그대로 살아남아 이번에 새로 로그인한 캐릭터의 레코드에 섞여 들어갔다(실측:
+            # 활성성 접속 시 무관한 전투력 472736이 붙어서 나옴, 사용자 지적 "전투력은
+            # 다른사람의 전투력을 착각한거 같다"). 로그인 스냅샷은 "이 entity_id에 대해
+            # 완전히 새로운 캐릭터 세션이 시작됐다"는 확실한 신호이므로, 이 시점에 이전
+            # 세션의 잔재를 통째로 비운다 - 그래야 이후 pending에 쌓이는 값은 전부 이번
+            # 캐릭터 것이라고 보장할 수 있다.
+            self.pending_oath.pop(ev.entity_id, None)
+            # 2026-07-09 추가(열두 번째 버그, 실측 - 사용자 확정 "실측에 맞게 가자"): 스냅샷
+            # 시각 기준 COMBAT_POWER_SNAPSHOT_GRACE 초 이내는 닉네임 미확인이어도 전투력을
+            # 신뢰하는 유예 구간으로 연다 - _on_combat_power 참고.
+            self.combat_power_grace_until = (ev.arrived_at if ev.arrived_at is not None else time.time()) + COMBAT_POWER_SNAPSHOT_GRACE
         else:
-            dynamic = ev.new_total
+            if getattr(ev, "base", None) is not None:
+                # 2026-07-09 추가(열세 번째 버그 수정): opcode(0x0C,0x61)의 "증가" 타입에
+                # 값 2개짜리 변형(header1=0x0c)이 있다는 게 실측으로 확인됨 - "추가오드" 아이템
+                # 사용 캡처(쌍검성, 4회 연속)에서 매번 왼쪽 숫자(v1=360, 변화 없음)와 오른쪽
+                # 숫자(v2, 델타 40씩 증가)를 같이 실어보냄. 예전엔 헤더가 `01 08 01`이 아니라는
+                # 이유만으로 이 opcode 전체가 무시돼서(사용자 실측: 아이템 먹어도 콘솔에 아무
+                # 로그도 안 남음) 이 아이템으로 얻는 오드에너지 증가가 통째로 안 잡히는 버그였다.
+                # 이 변형은 스냅샷처럼 왼쪽 숫자도 같이 알려주므로 known_base를 갱신한다.
+                # 주의: ev.new_total은 aion2_core.py 파서에서 이미 v1+v2로 계산돼 있으므로,
+                # 여기서 그대로 dynamic으로 쓰면 안 된다(base가 중복 계산됨) - ev.dynamic(오른쪽
+                # 숫자만)을 따로 꺼내 쓴다.
+                self.known_base = ev.base
+                dynamic = ev.dynamic
+            else:
+                dynamic = ev.new_total
 
         if ev.delta is None and self.last_dynamic is not None:
             ev.delta = dynamic - self.last_dynamic
@@ -261,6 +332,19 @@ class LiveCapture:
                 self.current_nickname, ev.new_total, ev.delta,
                 base=self.known_base, dynamic=dynamic, entity_id=ev.entity_id,
             )
+            # 2026-07-08 수정(중요 버그, 실측): 전투력 패킷은 자체 entity_id가 없어서
+            # "새 캐릭터 것인지" 독자적으로 판단 못 하고 _on_combat_power가 pending_oath에만
+            # 담아둔다 (아래 참고). 캐릭터 전환 직후 전투력 패킷이 이 오드에너지 이벤트보다
+            # 먼저 도착하는 경우가 실측으로 확인됐는데(예: 창법성→유틸성 전환 시 유틸성의
+            # 전투력이 창법성 이름으로 잘못 저장됨), 여기서 "이 오드에너지가 확실히
+            # current_nickname 것"이라고 확정된 시점에 밀려있던 전투력도 같이 반영해준다.
+            pending_cp = self.pending_oath.get(ev.entity_id)
+            if pending_cp and pending_cp.get("combat_power") is not None:
+                self.store.update_combat_power(
+                    self.current_nickname, pending_cp["combat_power"], entity_id=ev.entity_id,
+                )
+                pending_cp.pop("combat_power", None)
+                pending_cp.pop("combat_power_updated", None)
             ev.display_name = self.current_nickname
             ev.record = dict(self.store.data.get(self.current_nickname, {}))
         else:
@@ -280,10 +364,26 @@ class LiveCapture:
         self.event_queue.put(ev)
 
     def _is_trusted_oath_event(self, ev):
-        if ev.delta is not None:
-            return True  # "증가" 타입: total과 delta 두 필드가 있어 자체 교차검증됨
+        # 2026-07-08 수정(중요 버그): 예전엔 delta 필드가 있는 "증가" 타입이면 entity_id를
+        # 아예 확인 안 하고 무조건 신뢰했다 ("total/delta 두 값이 자체 교차검증된다"는 이유였는데,
+        # 실제로는 그 교차검증을 코드가 수행하지 않고 그냥 통과시키기만 했다). opcode(0x0C,0x61)가
+        # 오드에너지 말고 다른 카운터(각성전 티켓 등)에도 재사용되는 걸 이미 알고 있었는데, 그런
+        # 패킷이 우연히 "증가" 타입 구조(delta 필드 있음)로 오면 entity_id가 완전히 다른데도
+        # known_oath_id를 그 엉뚱한 id로 덮어써버렸다 - 실측으로 확인됨(id=74292가 known으로
+        # 등록되어 그 뒤 진짜 51591 이벤트가 전부 "[의심]"으로 무시됨, 오드정보가 None으로
+        # 빠지는 버그의 근본 원인). 51591은 여러 캐릭터/세션에 걸쳐 항상 동일한 계정 고정값으로
+        # 실측 확인됐으므로, 한 번 기준 id가 정해지면 델타 유무와 상관없이 반드시 그 id와
+        # 일치해야만 신뢰한다 - 콜드스타트(아직 기준 id 없음)일 때만 예외.
+        # 2026-07-09 수정(실측: 친구 PC, 신규/빈 oath_energy_data.json 상태): 콜드스타트 상태에서
+        # 무조건 첫 이벤트를 신뢰하면, 그 "첫 이벤트"가 우연히 opcode(0x0C,0x61) 재사용 카운터
+        # (74292 사례와 동급)일 경우 entity_id=0 같은 말이 안 되는 값이 영구 기준으로 등록돼버린다.
+        # 실측: 캐릭터 "불비"가 entity_id=0/오드 전부 0으로 저장되고, 그 뒤에 온 진짜 51591 이벤트가
+        # 전부 "[의심]"으로 계속 무시됨. entity_id=0은 지금까지의 모든 실측 계정에서 단 한 번도
+        # 정상값으로 관측된 적이 없으므로(실제 계정 고정값은 항상 0이 아닌 값, 예: 51591) 콜드스타트
+        # 여도 0은 신뢰하지 않는다 - known_oath_id가 여전히 None으로 남으므로 다음 이벤트에서 다시
+        # 판단하게 된다.
         if self.known_oath_id is None:
-            return True  # 콜드스타트: 아직 기준 id가 없으면 일단 신뢰하고 기준으로 삼음
+            return ev.entity_id != 0  # 콜드스타트: 0만 제외하고 첫 이벤트를 기준으로 삼음
         return ev.entity_id == self.known_oath_id
 
     def _on_nickname(self, ev):
@@ -302,11 +402,17 @@ class LiveCapture:
             )
             pending = self.pending_oath.pop(self.known_oath_id, None)
             if pending:
-                self.store.update_oath_energy(
-                    ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
-                    base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
-                    entity_id=self.known_oath_id,
-                )
+                # 2026-07-08 수정(중요 버그): pending에 combat_power만 있고 오드에너지 데이터가
+                # 없는 경우(예: 닉네임 재확인 대기 중 전투력 이벤트만 옴)에도 예전엔 무조건
+                # update_oath_energy를 호출했다 - new_total=None이 그대로 넘어가서 저장소의
+                # oath_energy를 None으로 덮어썼다 (실측: 표에 "None"으로 표시됨). pending에
+                # 오드에너지 데이터가 실제로 있을 때만 호출하도록 수정.
+                if pending.get("oath_energy") is not None:
+                    self.store.update_oath_energy(
+                        ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
+                        base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
+                        entity_id=self.known_oath_id,
+                    )
                 if pending.get("combat_power") is not None:
                     self.store.update_combat_power(
                         ev.nickname, pending["combat_power"], entity_id=self.known_oath_id,
@@ -318,19 +424,81 @@ class LiveCapture:
         # 2026-07-08: opcode(0x56,0x36)엔 entity_id 필드가 없어서(닉네임과 동일한 상황), 지금
         # 추적 중인 오드에너지 entity_id(known_oath_id)에 그대로 붙인다. 확정된 설계: 캐릭터
         # 인식(known_oath_id)이 아예 안 된 상태면 전투력도 무시한다 ("캐릭터 인식이 되어있어야
-        # 전투력이 인식되는것이 좋아" - 사용자 확인). 닉네임이 아직 확인 전이면(current_nickname
-        # 없음) pending_oath에만 담아두고 저장소엔 안 쓴다 (오드에너지와 동일한 이유).
+        # 전투력이 인식되는것이 좋아" - 사용자 확인).
+        #
+        # 2026-07-08 수정(중요 버그, 실측): 예전엔 current_nickname이 설정돼 있으면 바로
+        # 저장소에 썼다 - 그런데 전투력 패킷은 자체 entity_id가 없어서 "이게 새로 전환한
+        # 캐릭터 것인지" 독자적으로 판단할 방법이 전혀 없다. 캐릭터를 전환하면 새 캐릭터의
+        # 전투력 패킷이 오드에너지 스냅샷(전환 감지 신호, current_nickname 리셋의 유일한
+        # 계기)보다 먼저 도착하는 경우가 실측으로 확인됐다(예: 창법성 활동 중 → 유틸성 접속
+        # → 유틸성의 첫 전투력 패킷이 아직 안 리셋된 current_nickname="창법성"에 붙어서
+        # 창법성 기록이 유틸성 전투력으로 잘못 바뀜). 그래서 이제 전투력은 절대 즉시 쓰지
+        # 않고 항상 pending_oath에만 담아둔다 - 실제 저장은 (a) 오드에너지 이벤트가 "이건
+        # 확실히 current_nickname 것"이라고 확정해줄 때(_on_oath_energy 참고) 또는 (b) 닉네임이
+        # 막 확인될 때(_on_nickname) 두 시점에서만 이뤄진다. 둘 다 이미 신뢰 검증을 거친
+        # 시점이라 안전하다.
         if self.known_oath_id is None:
             return
+        # 2026-07-08 수정(열 번째 버그, 실측): 닉네임이 아직 확인 안 된 상태(current_nickname
+        # is None)에서 들어오는 전투력 패킷은 신뢰할 수 없다는 게 콘솔 로그로 확인됨 - 같은
+        # 1초 안에 서로 다른 전투력 값이 3번 연속으로 들어옴(472736 → 664074 → 773369).
+        # 실제 플레이 중인 캐릭터라면 전투력이 그렇게 짧은 시간에 여러 번 바뀔 이유가 없고,
+        # 캐릭터 선택 화면에서 목록의 여러 캐릭터를 훑으며 각각의 전투력을 미리 흘려보내는
+        # 패킷으로 추정된다(사용자 지적: "여기에 전투력 날라오는게 문제인거같다 이때 전투력은
+        # 갱신하지 않도록 해야할것 같다"). 그래서 닉네임이 확인되기 전에는 원칙적으로 무시한다.
+        #
+        # 2026-07-09 수정(열두 번째 버그, 실측 - "실측에 맞게 가자" 사용자 확정): 위 규칙을
+        # 그대로 적용하면 로그인 스냅샷 직후 도착하는 진짜 값도 같이 버려진다는 게 실측으로
+        # 드러났다 - 사용자가 올린 "전투력 404.6K" 캡처에서 스냅샷 -1.43초에 온 값(240725)은
+        # 남의 것이었지만, 스냅샷 +0.44초에 온 마지막 값(404618)은 게임 화면에서 직접 확인한
+        # 진짜 값이었다. 그래서 스냅샷 시각 기준 COMBAT_POWER_SNAPSHOT_GRACE 초 이내는
+        # 예외적으로 신뢰한다(닉네임 미확인이어도) - 그 구간을 벗어나면(닉네임 확인까지 보통
+        # 5~6초 걸리므로 이 유예 시간보다 훨씬 길다) 열 번째 버그의 미리보기 노이즈와 구분이
+        # 안 되므로 기존처럼 무시한다.
+        if self.current_nickname is None:
+            now = ev.arrived_at if ev.arrived_at is not None else time.time()
+            if self.combat_power_grace_until is None or now > self.combat_power_grace_until:
+                return
+            # 2026-07-09 추가: 이 예외 경로를 탄 값은 콘솔에 표시로 남겨서, 나중에 문제가 생기면
+            # "유예구간 예외로 들어온 값이었다"는 걸 바로 구분할 수 있게 한다 (사용자 지적:
+            # "닉네임없는 값을 허용하면 오드가 또 망가질수 있을것 같은데" - 오드에너지 자체는
+            # 이 코드와 별개의 entity_id 신뢰검증(_is_trusted_oath_event)으로 보호되어 이 변경의
+            # 영향을 받지 않지만, 전투력 값 자체의 신뢰도를 추적할 수 있도록 가시성을 남겨둔다).
+            self.status_queue.put(
+                f"[유예구간] 닉네임 미확인 상태지만 스냅샷 직후라 전투력 신뢰: {ev.combat_power}"
+            )
+        pending = self.pending_oath.setdefault(self.known_oath_id, {})
+        pending["combat_power"] = ev.combat_power
+        pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        # 2026-07-09 수정: grace 구간에서는 current_nickname이 아직 None일 수 있으므로(위 가드
+        # 통과), None일 때는 (열 번째 버그 이전과 동일하게) nickname=None인 임시 레코드를 만든다.
         if self.current_nickname:
-            self.store.update_combat_power(self.current_nickname, ev.combat_power, entity_id=self.known_oath_id)
-            record_snapshot = dict(self.store.data.get(self.current_nickname, {}))
+            # 2026-07-09 추가(배포 전 마무리, 실측): current_nickname이 설정돼 있어도, 다음
+            # 캐릭터로 전환되기 직전(스냅샷이 뜨기 몇백 ms 전)에 다음 캐릭터의 전투력 패킷이
+            # 먼저 도착하면 아직 안 리셋된 이전 캐릭터 이름 아래로 화면에 잘못 찍히는 게
+            # 실측됨(쌍검성 아래 472736, 활성성 아래 185157 - 둘 다 저장은 안 됐지만 콘솔에
+            # 잔상으로 남음). 저장(store.update_combat_power)은 애초에 여기서 안 하므로
+            # (열 번째 버그 이전부터 pending_oath 경유로만 저장됨) 안전하지만, 화면 표시만은
+            # 즉시 내보내지 않고 COMBAT_POWER_DISPLAY_DEBOUNCE 초 뒤로 미룬다 - 그 사이에
+            # 전환이 감지되면(_switch_epoch 증가) 낡은 값으로 판단해 조용히 버린다. 정상적인
+            # 상황(전환 없이 그냥 장비 교체 등)에서는 사람이 체감 못 할 짧은 지연일 뿐이다.
+            nickname_at_send = self.current_nickname
+            epoch_at_send = self._switch_epoch
+            cp_value = ev.combat_power
+            cp_updated = pending["combat_power_updated"]
+
+            def _emit_if_still_valid():
+                if self._switch_epoch != epoch_at_send:
+                    return  # 그 사이에 캐릭터 전환이 감지됨 - 이미 낡은 값, 화면에 안 보여줌
+                record_snapshot = {**dict(self.store.data.get(nickname_at_send, {})),
+                                   "combat_power": cp_value,
+                                   "combat_power_updated": cp_updated}
+                self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+
+            threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid).start()
         else:
-            pending = self.pending_oath.setdefault(self.known_oath_id, {})
-            pending["combat_power"] = ev.combat_power
-            pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
             record_snapshot = {"entity_id": self.known_oath_id, "nickname": None, **pending}
-        self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+            self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
     def _on_unknown(self, opcode, packet, arrived_at):
         self.status_queue.put(f"[debug] 알 수 없는 opcode {opcode} 프레임 수신 (len={len(packet)})")
@@ -494,14 +662,20 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
     last_record = store.data.get(last_nickname, {}) if last_nickname else {}
     known = {"id": last_record.get("entity_id")}
     known["base"] = last_record.get("oath_energy_base") or 0
+    # 2026-07-09: 로그인 스냅샷 직후 유예 구간 마감 시각 (LiveCapture.combat_power_grace_until와 동일).
+    known["cp_grace_until"] = None
+    # 2026-07-09: 전환 세대 번호 (LiveCapture._switch_epoch와 동일).
+    known["switch_epoch"] = 0
     # 2026-07-08: 닉네임 확인 전 오드에너지/전투력 데이터 임시 보관함 (LiveCapture.pending_oath와 동일).
     pending_oath = {}
 
     def is_trusted(ev):
-        if ev.delta is not None:
-            return True
+        # LiveCapture._is_trusted_oath_event 와 동일한 이유로 수정 (2026-07-08) - delta 유무로
+        # entity_id 검증을 건너뛰면 안 됨. (2026-07-09) 콜드스타트여도 entity_id=0은 신뢰 안 함 -
+        # 이유는 LiveCapture._is_trusted_oath_event의 주석 참고 (친구 PC 실측: id=0이 잘못 기준으로
+        # 등록되어 진짜 51591 이벤트가 전부 무시됨).
         if known["id"] is None:
-            return True
+            return ev.entity_id != 0
         return ev.entity_id == known["id"]
 
     def on_oath(ev):
@@ -521,8 +695,24 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
             current["job"] = None
             # GUI의 entity_nickname 캐시도 함께 무효화 (동일 이유, LiveCapture 쪽 주석 참고).
             event_queue.put(types.SimpleNamespace(forget_entity_id=ev.entity_id))
+            # LiveCapture._on_oath_energy 와 동일한 이유로 수정 (열한 번째 버그, 2026-07-08):
+            # pending_oath[entity_id]는 계정 공용이라 캐릭터 전환 후에도 이전 캐릭터의
+            # 미처 플러시되지 못한 combat_power가 남아있을 수 있다 - 로그인 스냅샷 시점에
+            # 통째로 비워서 이후 pending에 쌓이는 값은 전부 이번 캐릭터 것으로 보장한다.
+            pending_oath.pop(ev.entity_id, None)
+            # LiveCapture._on_oath_energy 와 동일한 이유로 수정 (열두 번째 버그, 2026-07-09):
+            # 스냅샷 시각 기준 COMBAT_POWER_SNAPSHOT_GRACE 초 이내는 닉네임 미확인이어도
+            # 전투력을 신뢰하는 유예 구간으로 연다.
+            known["cp_grace_until"] = (ev.arrived_at if ev.arrived_at is not None else 0) + COMBAT_POWER_SNAPSHOT_GRACE
+            # LiveCapture._on_oath_energy 와 동일한 이유로 수정 (배포 전 마무리, 2026-07-09).
+            known["switch_epoch"] += 1
         else:
-            dynamic = ev.new_total
+            if getattr(ev, "base", None) is not None:
+                # LiveCapture._on_oath_energy 와 동일한 이유로 수정 (열세 번째 버그, 2026-07-09).
+                known["base"] = ev.base
+                dynamic = ev.dynamic
+            else:
+                dynamic = ev.new_total
 
         if ev.delta is None and last_dynamic_holder["v"] is not None:
             ev.delta = dynamic - last_dynamic_holder["v"]
@@ -546,6 +736,17 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 current["nickname"], ev.new_total, ev.delta,
                 base=known["base"], dynamic=dynamic, entity_id=ev.entity_id,
             )
+            # 2026-07-08: 전투력 패킷은 자체 entity_id가 없어서 캐릭터 전환 중 오드에너지
+            # 스냅샷보다 먼저 도착하면 이전 캐릭터에게 잘못 붙는 문제(창법성→유틸성 오염
+            # 실측)가 있었다. on_combat_power가 이제 항상 pending_oath에 보류하므로,
+            # 여기서 신원이 확정되는 시점에 같은 entity_id로 보류된 전투력을 같이 반영한다.
+            pending_cp = pending_oath.get(ev.entity_id)
+            if pending_cp and pending_cp.get("combat_power") is not None:
+                store.update_combat_power(
+                    current["nickname"], pending_cp["combat_power"], entity_id=ev.entity_id,
+                )
+                pending_cp.pop("combat_power", None)
+                pending_cp.pop("combat_power_updated", None)
             ev.display_name = current["nickname"]
             ev.record = dict(store.data.get(current["nickname"], {}))
         else:
@@ -575,28 +776,68 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
             )
             pending = pending_oath.pop(known["id"], None)
             if pending:
-                store.update_oath_energy(
-                    ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
-                    base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
-                    entity_id=known["id"],
-                )
+                # LiveCapture._on_nickname 과 동일한 이유로 수정 (2026-07-08).
+                if pending.get("oath_energy") is not None:
+                    store.update_oath_energy(
+                        ev.nickname, pending.get("oath_energy"), pending.get("last_delta"),
+                        base=pending.get("oath_energy_base"), dynamic=pending.get("oath_energy_dynamic"),
+                        entity_id=known["id"],
+                    )
                 if pending.get("combat_power") is not None:
                     store.update_combat_power(ev.nickname, pending["combat_power"], entity_id=known["id"])
             record_snapshot = dict(store.data.get(ev.nickname, {}))
             event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
 
     def on_combat_power(ev):
+        # 2026-07-08 수정(전투력 오염 버그): 전투력 패킷엔 entity_id가 없어서, 캐릭터 전환
+        # 중 current["nickname"]을 그대로 믿고 바로 저장하면 "아직 리셋 안 된 이전 캐릭터
+        # 닉네임"에 새 캐릭터의 전투력이 잘못 저장될 수 있다(실측: 창법성 → 유틸성 전환 시
+        # 창법성의 전투력이 이상하게 바뀜). LiveCapture._on_combat_power와 동일하게, 항상
+        # pending_oath에 보류해두고 on_oath(신원 확정 시점)나 on_nickname에서만 실제로 반영한다.
         if known["id"] is None:
             return
+        # 2026-07-08 수정(열 번째 버그, 실측 - LiveCapture._on_combat_power와 동일 이유):
+        # 닉네임 미확인 상태(current["nickname"] is None)에서 오는 전투력은 원칙적으로 신뢰
+        # 불가 - 같은 1초 안에 서로 다른 값이 연속으로 들어오는 게 실측됨(캐릭터 선택 화면에서
+        # 목록을 훑을 때 각 캐릭터 전투력을 미리 흘려보내는 것으로 추정).
+        #
+        # 2026-07-09 수정(열두 번째 버그, 실측 - LiveCapture._on_combat_power와 동일 이유):
+        # 단, 로그인 스냅샷 시각 기준 COMBAT_POWER_SNAPSHOT_GRACE 초 이내는 예외 - 그 안에
+        # 도착하는 값은 실제 캐릭터의 진짜 값으로 확인됨("전투력 404.6K" 캡처).
+        if current["nickname"] is None:
+            now = ev.arrived_at if ev.arrived_at is not None else 0
+            grace = known.get("cp_grace_until")
+            if grace is None or now > grace:
+                return
+            # LiveCapture._on_combat_power와 동일한 이유로 콘솔에 표시 (2026-07-09).
+            status_queue.put(
+                f"[유예구간] 닉네임 미확인 상태지만 스냅샷 직후라 전투력 신뢰: {ev.combat_power}"
+            )
+        pending = pending_oath.setdefault(known["id"], {})
+        pending["combat_power"] = ev.combat_power
+        pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         if current["nickname"]:
-            store.update_combat_power(current["nickname"], ev.combat_power, entity_id=known["id"])
-            record_snapshot = dict(store.data.get(current["nickname"], {}))
+            # LiveCapture._on_combat_power와 동일한 이유로 화면 표시를 디바운스 (배포 전
+            # 마무리, 2026-07-09) - 전환 직전 잔상 방지.
+            nickname_at_send = current["nickname"]
+            epoch_at_send = known["switch_epoch"]
+            cp_value = ev.combat_power
+            cp_updated = pending["combat_power_updated"]
+
+            def _emit_if_still_valid():
+                if known["switch_epoch"] != epoch_at_send:
+                    return
+                record_snapshot = {
+                    **dict(store.data.get(nickname_at_send, {})),
+                    "combat_power": cp_value,
+                    "combat_power_updated": cp_updated,
+                }
+                event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+
+            threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid).start()
         else:
-            pending = pending_oath.setdefault(known["id"], {})
-            pending["combat_power"] = ev.combat_power
-            pending["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
             record_snapshot = {"entity_id": known["id"], "nickname": None, **pending}
-        event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+            event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
     proc = StreamProcessor(on_oath_energy=on_oath, on_nickname=on_nickname,
                             get_known_oath_id=lambda: known["id"],
@@ -638,7 +879,13 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
 
 def _fmt_info_cell(total, delta):
     """현황 표의 "오드 정보" 칸: 총량만 보여준다 (2026-07-08 - 사용자 요청으로 변화량(delta)
-    표시는 제거함. delta 파라미터는 호출부 호환을 위해 남겨두되 더는 사용하지 않는다)."""
+    표시는 제거함. delta 파라미터는 호출부 호환을 위해 남겨두되 더는 사용하지 않는다).
+
+    total이 None일 때(전투력 이벤트가 닉네임보다 먼저 와서 오드에너지 데이터 없이 행이 먼저
+    생기는 경우 - 2026-07-08, entity_id 신뢰 버그 수정 이후 실측으로 확인됨) 예전엔 문자열
+    "None"이 그대로 표에 찍혔다 - 전투력 칸의 "-"와 통일해서 아직 값 없음을 명확히 표시한다."""
+    if total is None:
+        return "-"
     return f"{total}"
 
 
@@ -847,6 +1094,9 @@ def run_gui(event_queue, status_queue):
     except Exception:
         pass  # 저장 파일이 없거나 읽기 실패해도 GUI 자체는 정상적으로 뜨도록 조용히 무시
 
+    def _console_ts():
+        return datetime.datetime.now().strftime("%H:%M:%S")
+
     def poll_queue():
         try:
             while True:
@@ -855,6 +1105,11 @@ def run_gui(event_queue, status_queue):
                 forget_id = getattr(ev, "forget_entity_id", None)
                 if forget_id is not None:
                     entity_nickname.pop(forget_id, None)
+                    # 2026-07-08: GUI 창의 상태 라벨(status_var)은 문자열 하나만 덮어쓰므로
+                    # 지나간 이벤트가 화면에서 사라진다. 사용자가 "모든 행동이 콘솔에 알림
+                    # 뜨도록" 요청 - GUI 모드에서도 콘솔(있으면)에 모든 이벤트/상태를 그대로
+                    # print해서, exe 콘솔 창을 보면 무슨 일이 일어났는지 전부 기록으로 남게 함.
+                    print(f"[{_console_ts()}] [알림] entity_id={forget_id} 닉네임 캐시 초기화 (캐릭터 전환 감지)")
                     continue
 
                 record = getattr(ev, "record", None)
@@ -862,15 +1117,23 @@ def run_gui(event_queue, status_queue):
                     render_summary(record)
                     nickname_confirmed = getattr(ev, "nickname_confirmed", False)
                     upsert_status_row(record, nickname_confirmed)
+                    nick = record.get("nickname") or f"캐릭터(id={record.get('entity_id')})"
+                    print(
+                        f"[{_console_ts()}] [갱신] {nick}  "
+                        f"오드={record.get('oath_energy')}  전투력={record.get('combat_power')}  "
+                        f"닉네임확인={'예' if nickname_confirmed else '아니오'}"
+                    )
                 else:
                     # record 스냅샷이 없는 예외적인 경우를 위한 최소한의 폴백
                     value_var.set(f"오드에너지 {ev.new_total}")
+                    print(f"[{_console_ts()}] [오드에너지] 총량={ev.new_total} (레코드 스냅샷 없음)")
         except queue.Empty:
             pass
         try:
             while True:
                 msg = status_queue.get_nowait()
                 status_var.set(msg)
+                print(f"[{_console_ts()}] [상태] {msg}")
         except queue.Empty:
             pass
         root.after(150, poll_queue)
@@ -897,6 +1160,66 @@ def run_console(event_queue, status_queue):
         else:
             sign = "+" if ev.delta >= 0 else ""
             print(f"[오드에너지] {name}  총량={ev.new_total}  변화={sign}{ev.delta}")
+
+
+# ---------------------------------------------------------------------------
+# 정기 충전(왼쪽 숫자) 시뮬레이션 - 실제 패킷 없이 시간 기준으로 추정 (2026-07-09 추가)
+# ---------------------------------------------------------------------------
+
+# 오드에너지 정기 충전 시각 (사용자 확인, 2026-07-07): 02/05/08/11/14/17/20/23시마다 왼쪽
+# 숫자에 +10(무구독) 또는 +15(로얄구독권)가 자동으로 붙는다. 프로그램이 구독권 활성 여부를
+# 알 방법이 없어서(게임 UI에서만 확인 가능, 패킷으로는 아직 못 찾음) 사용자 확정에 따라
+# +15로 고정한다 - "일단 자체 증가하는 수치는 15로 고정하고 실제 값은 로그인 하거나 특정
+# 이밴트시에 갱신 하면 될것 같아 이 작업의 용도는 오랫동안 안들어간 캐릭터에 대해서 오드량을
+# 예상하기위한 것이야".
+PERIODIC_REGEN_HOURS = (2, 5, 8, 11, 14, 17, 20, 23)
+PERIODIC_REGEN_AMOUNT = 15
+
+
+def _next_periodic_regen_time(now=None):
+    """PERIODIC_REGEN_HOURS 중 now 이후로 가장 가까운 정각(분/초 0)을 반환."""
+    now = now or datetime.datetime.now()
+    candidates = []
+    for day_offset in (0, 1):
+        base_day = now + datetime.timedelta(days=day_offset)
+        for hour in PERIODIC_REGEN_HOURS:
+            cand = base_day.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if cand > now:
+                candidates.append(cand)
+    return min(candidates)
+
+
+def _schedule_periodic_regen(store, status_queue):
+    """프로그램이 켜져 있는 동안 정기 충전 시각마다 저장된 모든 캐릭터의 왼쪽 숫자(기본
+    오드)를 실제 패킷 없이 자동으로 +15 해준다 (사용자 요청, 2026-07-09) - "우리 프로그램이
+    돌고있는동안 2시 5시 8시 11시 오전 오후로 15씩 증가하는 로직은 추가할수 있지 않아?".
+
+    실측값과 필드 상 구분하지 않고 그대로 합산한다(CharacterStore.apply_periodic_regen 참고,
+    사용자 확정: "구분 없이 그냥 합산해서 json에 담아 넣는데 대신 시간마다 증가되는 오드는
+    추가 오드가 아닌 기본(왼쪽)오드"). 다음에 실제 로그인/이 문서의 [[Thirteenth bug]] 2값
+    변형 이벤트 등으로 진짜 값이 확인되면 그 값이 그대로 덮어써지므로 자연히 보정된다.
+
+    적용 대상은 저장된 모든 캐릭터(사용자 확정: "저장된 모든 캐릭터한테 적용") - 리플레이
+    모드(replay_pcap)에는 연결하지 않는다. 리플레이는 과거 캡처 재생/검증용이라 지금 이 순간의
+    실제 벽시계 시각 기준 정기 충전을 적용하면 검증 결과가 왜곡된다.
+
+    프로그램을 껐다 켠 사이에 지나간 정기 충전은 소급 적용하지 않는다 - 다음 예약 시각은
+    항상 "지금 이후 가장 가까운 시각"으로 계산되므로, 꺼져 있던 동안의 충전은 놓친다(다음
+    실제 로그인 시 정확한 값으로 보정되므로 큰 문제는 아니라고 판단).
+    """
+    def _fire():
+        try:
+            store.apply_periodic_regen(PERIODIC_REGEN_AMOUNT)
+            status_queue.put(
+                f"[정기충전] 저장된 모든 캐릭터의 왼쪽 숫자(기본 오드)에 +{PERIODIC_REGEN_AMOUNT} 추정 반영"
+            )
+        except Exception as e:
+            status_queue.put(f"[정기충전][에러] 적용 실패: {e!r}")
+        _schedule_periodic_regen(store, status_queue)  # 다음 시각으로 재예약
+
+    next_time = _next_periodic_regen_time()
+    delay = max((next_time - datetime.datetime.now()).total_seconds(), 1.0)
+    threading.Timer(delay, _fire).start()
 
 
 def main():
@@ -942,6 +1265,12 @@ def main():
                                iface=args.iface, debug=args.debug)
         capture.start()
         print(f"실시간 캡처 시작: {server_net}:{args.port} (관리자 권한 필요)")
+        # 2026-07-09 추가: 실시간 캡처 모드에서만 정기 충전 추정 스케줄러를 켠다 (리플레이는
+        # 과거 캡처 검증용이라 현재 벽시계 시각 기준 로직을 붙이면 안 됨). LiveCapture가 이미
+        # 만들어둔 store 인스턴스를 그대로 재사용 - 별도 CharacterStore를 새로 만들면 두
+        # 인스턴스가 서로 다른 시점의 메모리 상태로 각자 파일에 저장하면서 상대방의 변경을
+        # 덮어쓰는 경쟁이 생길 수 있다.
+        _schedule_periodic_regen(capture.store, status_queue)
 
     if args.no_gui:
         run_console(event_queue, status_queue)

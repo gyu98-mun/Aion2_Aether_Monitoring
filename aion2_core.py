@@ -102,38 +102,64 @@ def parse_oath_energy_payload(payload: bytes):
     호출측(aion2_live_monitor.py)이 "왼쪽 숫자"(known_base, 로그인 스냅샷에서만 얻을 수 있음)를
     따로 들고 있다가 이 이벤트의 new_total 과 더해서 진짜 총량을 계산해야 한다.
 
-    2가지 서브타입이 확인됨 (헤더의 3번째 바이트 앞부분 값으로 구분되는 것으로 추정, 정확한 의미는 미확정):
-      1) "증가" 타입 (아이템 사용으로 오드에너지 획득, 두 번 확인: 1585->1625, 1625->1665):
-         01 08 01 [varint id] [varint new_total] [flag=01] [int32 LE delta]   (payload 13바이트)
-      2) "감소" 타입 (던전 등에서 소모, t=318.89s 캡처로 확인 - 새총량 1145):
-         00 08 01 [varint id] [varint new_total] [단일 바이트, 의미 미상]      (payload 9바이트, delta 필드 없음)
+    헤더의 2번째 바이트(header1)가 "값이 몇 개 들어있는지"를 가리킨다 - 로그인 스냅샷 opcode의
+    tag 바이트(0x04=값 1개, 0x0c=값 2개)와 동일한 규칙:
+      - header1=0x08 → 값 1개(new_total만, 왼쪽/오른쪽 분리 없음) - 원래 발견된 형태:
+        01 08 01 [varint id] [varint new_total] [flag=01] [int32 LE delta]   (payload 13바이트, "증가")
+        00 08 01 [varint id] [varint new_total] [단일 바이트, 의미 미상]      (payload 9바이트, "감소")
+      - header1=0x0c → 값 2개(v1=왼쪽 숫자/base, v2=오른쪽 숫자/dynamic, new_total=v1+v2) - **2026-07-09
+        추가 발견**, "추가오드" 아이템 사용 캡처(쌍검성, 4회 연속 사용)에서 확인됨:
+        01 0c 01 [varint id] [varint v1] [varint v2] [flag=01] [int32 LE delta]  ("증가"의 2값 변형)
+        실측 4개 샘플 전부 v1=360(쌍검성의 실제 base와 일치, 변화 없음), v2가 125→165→205→245로
+        델타(40)만큼씩 정확히 증가 - 즉 v1은 스냅샷과 마찬가지로 "왼쪽 숫자"를 매번 재확인시켜주고,
+        v2는 기존 "증가" 이벤트의 new_total과 같은 의미(오른쪽 숫자). **이 변형을 놓치면 헤더가
+        `01 08 01`이 아니라는 이유만으로 완전히 무시되어(사용자 실측: 콘솔에 아무 로그도 안 남음,
+        `--debug` 없이는 조용히 버려짐) 해당 아이템을 쓸 때마다 오드에너지 증가가 통째로 안 잡히는
+        버그가 됨 - "감소"(header0=0x00) 쪽에 2값 변형이 있는지는 아직 실측 안 됐지만, 대칭적으로
+        같이 지원해둔다(값이 안 맞으면 length/plausibility 검증에서 어차피 걸러짐).**
 
-    두 타입 모두 앞 3바이트를 건너뛰고 varint id, varint new_total 까지는 동일하게 파싱된다.
-    그 뒤에 flag+int32 delta 를 담을 공간(5바이트)이 남아있으면 그걸 delta 로 쓰고,
-    아니면 delta=None 으로 두고 new_total 만 반환한다 (호출측이 이전 값과의 차이로 delta 를 계산해야 함).
+    두 타입 모두 앞 3바이트(header0/1/2)를 확인 후 varint id로 시작한다. 그 뒤 값 varint를
+    header1에 따라 1개 또는 2개 읽고, 마지막으로 header0에 따라 flag+int32 delta(증가, 5바이트)가
+    남거나 의미 미상 1바이트(감소)만 남아야 한다 - 셋 중 하나라도 구조/길이/값 범위가 안 맞으면
+    None을 반환해 "이 패킷엔 오드에너지 정보가 없다"고 정직하게 실패한다.
 
-    검증 로직(2026-07-07 추가): 예전에는 앞 3바이트를 값 확인 없이 무조건 건너뛰고, 그 뒤 남는
-    바이트 수도 확인하지 않았음 - opcode(0x0C,0x61)가 오드에너지가 아닌 다른 용도로 재사용되는
-    패킷이 오면(구조가 우연히 비슷해 보여도) 그대로 파싱을 시도해서 엉뚱한 값, 특히 0을 오드에너지로
-    잘못 찍는 문제가 있었다. 이제는 (a) 헤더 3바이트가 정확히 `01 08 01` 또는 `00 08 01`인지,
-    (b) id/total varint를 읽고 남은 바이트 수가 서브타입에 딱 맞는 길이(증가=5, 감소=1)인지,
-    (c) total 값이 오드에너지로 그럴듯한 범위인지(_is_plausible_oath_energy) 까지 확인해야 이벤트로
-    인정한다. 셋 중 하나라도 안 맞으면 이 패킷은 오드에너지 정보를 담고 있지 않은 것으로 보고 None.
+    검증 로직(2026-07-07 추가, 2026-07-09 확장): 헤더 3바이트가 정확히 `0x/08/01` 또는
+    `0x/0c/01`(0x는 0x00 또는 0x01)인지, id/값(들) varint를 읽고 남은 바이트 수가 서브타입에
+    딱 맞는 길이(증가=5, 감소=1)인지, 최종 total 값이 오드에너지로 그럴듯한 범위인지
+    (_is_plausible_oath_energy) 까지 확인해야 이벤트로 인정한다.
     """
     if len(payload) < 3:
         return None
     header0, header1, header2 = payload[0], payload[1], payload[2]
-    if header1 != 0x08 or header2 != 0x01 or header0 not in (0x00, 0x01):
+    if header2 != 0x01 or header0 not in (0x00, 0x01):
+        return None
+    if header1 not in (0x08, 0x0c):
         return None
     pos = 3
     id_vi = read_varint(payload, pos)
     if id_vi.length <= 0:
         return None
     pos += id_vi.length
-    total_vi = read_varint(payload, pos)
-    if total_vi.length <= 0:
+
+    v1_vi = read_varint(payload, pos)
+    if v1_vi.length <= 0:
         return None
-    pos += total_vi.length
+    pos += v1_vi.length
+
+    base = None
+    dynamic = None
+    if header1 == 0x0c:
+        # 2026-07-09 추가: 값 2개짜리 변형 - v1=왼쪽 숫자(base), v2=오른쪽 숫자(dynamic)
+        v2_vi = read_varint(payload, pos)
+        if v2_vi.length <= 0:
+            return None
+        pos += v2_vi.length
+        base = v1_vi.value
+        dynamic = v2_vi.value
+        total = base + dynamic
+    else:
+        dynamic = v1_vi.value
+        total = dynamic
 
     remaining = len(payload) - pos
     delta = None
@@ -147,10 +173,17 @@ def parse_oath_energy_payload(payload: bytes):
         if remaining != 1:
             return None
 
-    if not _is_plausible_oath_energy(total_vi.value):
+    if not _is_plausible_oath_energy(total):
         return None
 
-    return OathEnergyEvent(id_vi.value, total_vi.value, delta, payload)
+    ev = OathEnergyEvent(id_vi.value, total, delta, payload)
+    if base is not None:
+        # 2026-07-09 추가: 값 2개짜리 변형은 왼쪽 숫자도 같이 알려주므로, 스냅샷과 동일하게
+        # .base/.dynamic 속성을 채워서 호출측(aion2_live_monitor.py)이 known_base를 갱신할 수
+        # 있게 한다 - 일반 1값짜리 변형(header1=0x08)은 이 속성이 아예 없음(기존 동작 유지).
+        ev.base = base
+        ev.dynamic = dynamic
+    return ev
 
 
 def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):

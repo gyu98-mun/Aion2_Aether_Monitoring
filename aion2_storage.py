@@ -38,6 +38,12 @@ pending_oath 딕셔너리), 닉네임이 확인되는 순간 병합해서 저장
   },
   ...
 }
+
+**2026-07-09 추가: oath_energy_base/oath_energy 에는 실측값 외에 "추정치"도 섞여 들어갈 수 있다.**
+`apply_periodic_regen()` (aion2_live_monitor.py의 스케줄러가 02/05/08/11/14/17/20/23시마다 호출)이
+정기 충전(+15, 왼쪽 숫자)을 실제 패킷 없이 시간 기준으로 흉내내서 이 필드들에 직접 더한다 -
+사용자 요청으로 실측값과 필드 상으로는 구분하지 않는다(다음 실제 로그인/이벤트가 오면 그 값으로
+덮어써지면서 자연히 보정됨).
 """
 
 import json
@@ -115,13 +121,18 @@ class CharacterStore:
         record = self._get_or_create(nickname)
         if entity_id is not None:
             record["entity_id"] = entity_id
-        record["oath_energy"] = new_total
         if base is not None:
             record["oath_energy_base"] = base
         if dynamic is not None:
             record["oath_energy_dynamic"] = dynamic
-        record["last_delta"] = delta
-        record["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        # 2026-07-08 수정(중요 버그): new_total 이 None 이어도 예전엔 무조건 record["oath_energy"]에
+        # 덮어썼다 - 호출측(aion2_live_monitor.py)이 실수로 None을 넘기면 이미 저장돼 있던 정상적인
+        # oath_energy 값이 None으로 지워지는 문제가 실측으로 확인됨(표에 "None" 표시). base/dynamic과
+        # 똑같이 None이면 "이번엔 갱신 안 됨"으로 취급해 기존 값을 그대로 둔다.
+        if new_total is not None:
+            record["oath_energy"] = new_total
+            record["last_delta"] = delta
+            record["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         self._save()
 
     def update_combat_power(self, nickname, combat_power, entity_id=None):
@@ -131,6 +142,30 @@ class CharacterStore:
             record["entity_id"] = entity_id
         record["combat_power"] = combat_power
         record["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        self._save()
+
+    def apply_periodic_regen(self, amount):
+        """2026-07-09 추가: 게임 서버의 정기 충전(02/05/08/11/14/17/20/23시, "왼쪽 숫자"에
+        +10 또는 +15)을 실제 패킷 없이 우리 프로그램이 시간 기준으로 직접 흉내낸다
+        (aion2_live_monitor.py의 스케줄러가 이 시각마다 호출). 사용자 요청 배경: "오랫동안
+        안 들어간 캐릭터에 대해서 오드량을 예상하기 위한 것" - 실제 로그인/이벤트로 확인된 값이
+        아니라 추정치이지만, 사용자가 명시적으로 "구분 없이 그냥 합산해서 json에 담아 넣어라"고
+        확정했으므로 oath_energy_base/oath_energy 필드에 실측값과 구분 없이 바로 더한다.
+        **주의: 이 증가분은 왼쪽 숫자(oath_energy_base)에 더해지는 것이지 오른쪽 숫자
+        (oath_energy_dynamic, 추가오드/아이템 누적분)가 아니다** - 사용자가 명시적으로
+        구분해달라고 확인함. last_updated는 건드리지 않는다 - most_recent_character()가
+        이 값으로 "최근에 실제로 플레이한 캐릭터"를 판단하는데, 정기 충전은 전체 캐릭터에
+        동시에 적용되는 이벤트라 실제 활동 시각과 혼동되면 안 된다.
+
+        적용 대상: 저장된 모든 캐릭터(사용자 확인: "저장된 모든 캐릭터한테 적용"). 아직 한
+        번도 오드에너지가 확인된 적 없는 캐릭터(oath_energy_base가 None)는 건너뛴다 - 실측값이
+        전혀 없는 캐릭터에 추정치만으로 레코드를 만드는 건 오히려 혼란을 주므로.
+        """
+        for record in self.data.values():
+            if record.get("oath_energy_base") is None:
+                continue
+            record["oath_energy_base"] += amount
+            record["oath_energy"] = (record.get("oath_energy") or 0) + amount
         self._save()
 
     def most_recent_character(self):
