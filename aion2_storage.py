@@ -144,6 +144,8 @@ class CharacterStore:
         record["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         self._save()
 
+    OATH_ENERGY_BASE_CAP = 840  # 2026-07-09 추가: 왼쪽 숫자(기본 오드)의 게임 내 한도 (사용자 확인)
+
     def apply_periodic_regen(self, amount):
         """2026-07-09 추가: 게임 서버의 정기 충전(02/05/08/11/14/17/20/23시, "왼쪽 숫자"에
         +10 또는 +15)을 실제 패킷 없이 우리 프로그램이 시간 기준으로 직접 흉내낸다
@@ -160,12 +162,23 @@ class CharacterStore:
         적용 대상: 저장된 모든 캐릭터(사용자 확인: "저장된 모든 캐릭터한테 적용"). 아직 한
         번도 오드에너지가 확인된 적 없는 캐릭터(oath_energy_base가 None)는 건너뛴다 - 실측값이
         전혀 없는 캐릭터에 추정치만으로 레코드를 만드는 건 오히려 혼란을 주므로.
+
+        **2026-07-09 추가: 840 한도 적용.** 사용자 확인: "기본오드는 840이 한계". 오래 접속
+        안 한 캐릭터는 이 시뮬레이션이 여러 번 누적되면서 실제 게임 서버가 절대 허용 안 하는
+        840 초과 값을 만들어낼 수 있어서, oath_energy_base를 840에서 클램프한다. 이미 840에
+        도달했으면 이번 틱은 실질적으로 증가분이 0(그대로 유지) - amount를 무조건 더해서
+        넘치게 두지 않는다. oath_energy(총량)에는 "실제로 증가한 만큼"만 반영해서 base+dynamic
+        합산 불변식이 깨지지 않게 한다(그냥 amount를 그대로 더하면 총량만 840 초과분까지 따라
+        올라가서 base/총량이 서로 안 맞게 됨).
         """
         for record in self.data.values():
-            if record.get("oath_energy_base") is None:
+            base = record.get("oath_energy_base")
+            if base is None:
                 continue
-            record["oath_energy_base"] += amount
-            record["oath_energy"] = (record.get("oath_energy") or 0) + amount
+            new_base = min(base + amount, self.OATH_ENERGY_BASE_CAP)
+            actual_added = new_base - base
+            record["oath_energy_base"] = new_base
+            record["oath_energy"] = (record.get("oath_energy") or 0) + actual_added
         self._save()
 
     def most_recent_character(self):

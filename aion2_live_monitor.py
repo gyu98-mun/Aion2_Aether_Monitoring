@@ -877,16 +877,18 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
 # GUI (Tkinter) - 대시보드와 같은 내용(닉네임/총량/왼쪽·오른쪽/최근 이력)을 창 안에서 바로 표시
 # ---------------------------------------------------------------------------
 
-def _fmt_info_cell(total, delta):
-    """현황 표의 "오드 정보" 칸: 총량만 보여준다 (2026-07-08 - 사용자 요청으로 변화량(delta)
-    표시는 제거함. delta 파라미터는 호출부 호환을 위해 남겨두되 더는 사용하지 않는다).
+def _fmt_info_cell(value):
+    """현황 표의 "기본"/"추가" 칸 공용 포맷터 (2026-07-09: 기존엔 오드 총량 하나만 보여주는
+    "오드 정보" 단일 칸이었는데, 사용자 요청으로 oath_energy_base("기본")와
+    oath_energy_dynamic("추가")를 별도 두 칸으로 나눠 보여주도록 변경 - 두 칸 모두 이 함수를
+    그대로 재사용한다 (단순히 값이 있으면 문자열로, 없으면 "-").
 
-    total이 None일 때(전투력 이벤트가 닉네임보다 먼저 와서 오드에너지 데이터 없이 행이 먼저
+    value가 None일 때(전투력 이벤트가 닉네임보다 먼저 와서 오드에너지 데이터 없이 행이 먼저
     생기는 경우 - 2026-07-08, entity_id 신뢰 버그 수정 이후 실측으로 확인됨) 예전엔 문자열
     "None"이 그대로 표에 찍혔다 - 전투력 칸의 "-"와 통일해서 아직 값 없음을 명확히 표시한다."""
-    if total is None:
+    if value is None:
         return "-"
-    return f"{total}"
+    return f"{value}"
 
 
 def _fmt_date_cell(ts):
@@ -962,15 +964,17 @@ def run_gui(event_queue, status_queue):
     hist_scroll.pack(side="right", fill="y")
 
     hist_tree = ttk.Treeview(
-        hist_frame, columns=("nickname", "info", "combat_power", "updated"), show="headings",
+        hist_frame, columns=("nickname", "base", "extra", "combat_power", "updated"), show="headings",
         yscrollcommand=hist_scroll.set, style="Dark.Treeview",
     )
     hist_tree.heading("nickname", text="닉네임")
-    hist_tree.heading("info", text="오드 정보")
+    hist_tree.heading("base", text="기본")
+    hist_tree.heading("extra", text="추가")
     hist_tree.heading("combat_power", text="전투력")
     hist_tree.heading("updated", text="갱신날짜")
     hist_tree.column("nickname", width=80, anchor="w")
-    hist_tree.column("info", width=110, anchor="w")
+    hist_tree.column("base", width=70, anchor="w")
+    hist_tree.column("extra", width=70, anchor="w")
     hist_tree.column("combat_power", width=80, anchor="w")
     hist_tree.column("updated", width=140, anchor="w")
     hist_tree.pack(side="left", fill="both", expand=True)
@@ -1024,7 +1028,8 @@ def run_gui(event_queue, status_queue):
 
             values = (
                 nickname,
-                _fmt_info_cell(merged.get("oath_energy"), merged.get("last_delta")),
+                _fmt_info_cell(merged.get("oath_energy_base")),
+                _fmt_info_cell(merged.get("oath_energy_dynamic")),
                 _fmt_combat_power_cell(merged.get("combat_power")),
                 _fmt_date_cell(merged.get("last_updated")),
             )
@@ -1048,7 +1053,8 @@ def run_gui(event_queue, status_queue):
             return
         values = (
             known_nick,
-            _fmt_info_cell(record.get("oath_energy"), record.get("last_delta")),
+            _fmt_info_cell(record.get("oath_energy_base")),
+            _fmt_info_cell(record.get("oath_energy_dynamic")),
             _fmt_combat_power_cell(record.get("combat_power")),
             _fmt_date_cell(record.get("last_updated")),
         )
