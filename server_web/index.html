@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>AION2 오드에너지 조회</title>
+<style>
+  body { font-family: -apple-system, "Malgun Gothic", sans-serif; background:#12121a; color:#eee; margin:0; padding:24px; }
+  h1 { font-size: 18px; margin-bottom: 16px; }
+  .search-row { display:flex; gap:8px; margin-bottom:20px; }
+  input[type=text] { flex:1; padding:8px 10px; border-radius:6px; border:1px solid #333; background:#1c1c26; color:#eee; }
+  button { padding:8px 14px; border-radius:6px; border:none; background:#4FC3F7; color:#111; font-weight:bold; cursor:pointer; }
+  button:hover { background:#7fd6ff; }
+  #status { color:#999; font-size:13px; margin-bottom:12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #2a2a36; font-size:14px; }
+  th { color:#999; font-weight:normal; }
+  .num { color:#4FC3F7; font-weight:bold; }
+  .owner { color:#999; font-size:12px; }
+</style>
+</head>
+<body>
+  <h1>AION2 오드에너지 조회 (2단계 - 서버 DB)</h1>
+  <div class="search-row">
+    <input type="text" id="nickname" placeholder="닉네임으로 검색 (비워두면 전체 목록)">
+    <button onclick="search()">조회</button>
+  </div>
+  <div id="status"></div>
+  <table>
+    <thead>
+      <tr>
+        <th>닉네임</th><th>owner</th><th>기본</th><th>추가</th><th>총합</th>
+        <th>전투력</th><th>템렙</th><th>갱신(게임 기준)</th><th>서버 수신 시각</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+<script>
+async function search() {
+  const nickname = document.getElementById('nickname').value.trim();
+  const statusEl = document.getElementById('status');
+  const rowsEl = document.getElementById('rows');
+  statusEl.textContent = '조회 중...';
+  rowsEl.innerHTML = '';
+  try {
+    const url = nickname ? `/api/characters/${encodeURIComponent(nickname)}` : '/api/characters';
+    const resp = await fetch(url);
+    if (resp.status === 404) {
+      statusEl.textContent = '해당 닉네임을 찾을 수 없습니다.';
+      return;
+    }
+    if (!resp.ok) {
+      statusEl.textContent = `조회 실패 (status=${resp.status})`;
+      return;
+    }
+    const data = await resp.json();
+    statusEl.textContent = `${data.length}건`;
+    for (const r of data) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${r.nickname}</td>
+        <td class="owner">${r.owner ?? ''}</td>
+        <td class="num">${r.oath_energy_base ?? '-'}</td>
+        <td class="num">${r.oath_energy_dynamic ?? '-'}</td>
+        <td class="num">${r.oath_energy ?? '-'}</td>
+        <td>${r.combat_power ?? '-'}</td>
+        <td>${r.item_level ?? '-'}</td>
+        <td>${r.last_updated ?? '-'}</td>
+        <td>${r.server_received_at ?? '-'}</td>
+      `;
+      rowsEl.appendChild(tr);
+    }
+  } catch (e) {
+    statusEl.textContent = `오류: ${e}`;
+  }
+}
+document.getElementById('nickname').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') search();
+});
+search(); // 최초 로딩 시 전체 목록
+</script>
+</body>
+</html>

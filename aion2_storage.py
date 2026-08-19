@@ -34,16 +34,25 @@ pending_oath 딕셔너리), 닉네임이 확인되는 순간 병합해서 저장
     "last_delta": int | null,
     "last_updated": "ISO8601 문자열" | null,
     "combat_power": int | null,       # 전투력 (2026-07-08 추가, opcode(0x56,0x36))
-    "combat_power_updated": "ISO8601 문자열" | null
+    "combat_power_updated": "ISO8601 문자열" | null,
+    "oath_energy_regen_checkpoint": "ISO8601 문자열" | null,  # 2026-07-18 추가, 아래 참고
+    "item_level": int | null,         # 템레벨 (2026-07-19 추가, opcode(0x1D,0x56))
+    "item_level_updated": "ISO8601 문자열" | null
   },
   ...
 }
 
 **2026-07-09 추가: oath_energy_base/oath_energy 에는 실측값 외에 "추정치"도 섞여 들어갈 수 있다.**
-`apply_periodic_regen()` (aion2_live_monitor.py의 스케줄러가 02/05/08/11/14/17/20/23시마다 호출)이
-정기 충전(+15, 왼쪽 숫자)을 실제 패킷 없이 시간 기준으로 흉내내서 이 필드들에 직접 더한다 -
-사용자 요청으로 실측값과 필드 상으로는 구분하지 않는다(다음 실제 로그인/이벤트가 오면 그 값으로
-덮어써지면서 자연히 보정됨).
+`apply_periodic_regen()`/`catch_up_periodic_regen()` (아래 참고)이 정기 충전(+15, 왼쪽 숫자)을
+실제 패킷 없이 시간 기준으로 흉내내서 이 필드들에 직접 더한다 - 사용자 요청으로 실측값과 필드
+상으로는 구분하지 않는다(다음 실제 로그인/이벤트가 오면 그 값으로 덮어써지면서 자연히 보정됨).
+
+**2026-07-18 추가: `oath_energy_regen_checkpoint`.** 정기충전을 마지막으로 계산에 반영한
+시각(ISO8601). `catch_up_periodic_regen()`이 이 시각과 지금 사이에 정기충전 정각이 몇 번
+지났는지 세서 한 번에 몰아 적용하고, 적용 후 이 값을 지금 시각으로 갱신한다 - 프로그램이
+꺼져있던 동안 놓친 정기충전을 다음 실행 때 소급으로 보상하기 위한 필드(사용자 제안).
+`update_oath_energy()`가 실측 base를 받을 때도 이 값을 그 시각으로 맞춰서, 실측과 시뮬레이션이
+같은 시간 구간을 중복 가산하지 않게 한다.
 """
 
 import json
@@ -62,10 +71,44 @@ else:
 DEFAULT_PATH = os.path.join(_BASE_DIR, "oath_energy_data.json")
 
 
+def _count_ticks_since(start, end, tick_hours):
+    """2026-07-18 추가: start(제외) 부터 end(포함) 사이에 tick_hours(예: (2,5,8,11,14,17,20,23))
+    정각이 몇 번 있었는지 센다. `CharacterStore.catch_up_periodic_regen`이 소급 계산에 사용."""
+    if start >= end:
+        return 0
+    count = 0
+    day = start.date()
+    last_day = end.date()
+    while day <= last_day:
+        for hour in tick_hours:
+            t = datetime.datetime.combine(day, datetime.time(hour=hour))
+            if start < t <= end:
+                count += 1
+        day += datetime.timedelta(days=1)
+    return count
+
+
 class CharacterStore:
-    def __init__(self, path=DEFAULT_PATH):
+    def __init__(self, path=DEFAULT_PATH, on_change=None):
+        """`on_change` (2026-08-13, 2단계 서버 업로드 대비 추가): 캐릭터 레코드가 실제로
+        갱신될 때마다 그 레코드 dict 하나를 인자로 호출되는 콜백. 이 파일(storage.py)은
+        순수 로컬 저장 책임만 지고 네트워크는 전혀 모른다는 원칙을 지키기 위해, 실제
+        서버 업로드 로직(aion2_uploader.py)은 여기서 직접 import하지 않고 호출자
+        (aion2_live_monitor.py의 LiveCapture)가 콜백으로 주입한다 - replay_pcap은 이
+        콜백을 넘기지 않으므로 리플레이 모드는 지금처럼 부작용 없이 그대로 유지된다
+        (정기충전을 replay에 연결하지 않은 것과 동일한 원칙). 콜백에서 예외가 나도
+        저장 자체(로컬 파일 쓰기)는 절대 실패하면 안 되므로 `_notify`에서 항상 삼킨다."""
         self.path = path
+        self.on_change = on_change
         self.data = self._load()
+
+    def _notify(self, nickname):
+        if self.on_change is None:
+            return
+        try:
+            self.on_change(self.data.get(nickname))
+        except Exception:
+            pass
 
     def _load(self):
         if os.path.exists(self.path):
@@ -97,6 +140,9 @@ class CharacterStore:
                 "last_updated": None,
                 "combat_power": None,
                 "combat_power_updated": None,
+                "oath_energy_regen_checkpoint": None,  # 2026-07-18 추가, catch_up_periodic_regen 참고
+                "item_level": None,  # 2026-07-19 추가, opcode(0x1D,0x56)
+                "item_level_updated": None,
             }
         return self.data[nickname]
 
@@ -111,6 +157,7 @@ class CharacterStore:
         if job is not None:
             record["job"] = job
         self._save()
+        self._notify(nickname)
 
     def update_oath_energy(self, nickname, new_total, delta, base=None, dynamic=None, entity_id=None):
         """new_total 은 항상 "진짜 총 소지량"(base+dynamic)이어야 한다 - 호출측
@@ -123,6 +170,13 @@ class CharacterStore:
             record["entity_id"] = entity_id
         if base is not None:
             record["oath_energy_base"] = base
+            # 2026-07-18 추가: 실측(로그인 스냅샷/2값 증가 이벤트)으로 base가 갱신되는 순간은
+            # "이 시각까지의 정기충전을 이미 포함한 진짜 값"이라는 뜻이다 - catch_up_periodic_regen
+            # 이 다음번에 "체크포인트 이후 지난 정기충전 횟수"를 셀 때, 이 실측 시각 이전 구간을
+            # 또 세서 중복 가산하지 않도록 체크포인트를 여기서 실측 시각으로 맞춰준다(사용자 확정:
+            # "갱신 시간부터 소급하는 방향" - last_updated를 소급 기준점으로 삼되, 실측이 올 때마다
+            # 그 기준점 자체를 최신으로 당겨놓는 방식).
+            record["oath_energy_regen_checkpoint"] = datetime.datetime.now().isoformat(timespec="seconds")
         if dynamic is not None:
             record["oath_energy_dynamic"] = dynamic
         # 2026-07-08 수정(중요 버그): new_total 이 None 이어도 예전엔 무조건 record["oath_energy"]에
@@ -134,6 +188,7 @@ class CharacterStore:
             record["last_delta"] = delta
             record["last_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         self._save()
+        self._notify(nickname)
 
     def update_combat_power(self, nickname, combat_power, entity_id=None):
         """전투력 갱신. 오드에너지처럼 history 를 남기진 않는다 - 필요해지면 그때 추가."""
@@ -143,6 +198,29 @@ class CharacterStore:
         record["combat_power"] = combat_power
         record["combat_power_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
         self._save()
+        self._notify(nickname)
+
+    def update_item_level(self, nickname, item_level, entity_id=None):
+        """템레벨 갱신 (2026-07-19 추가, opcode(0x1D,0x56)). update_combat_power와 완전히
+        동일한 구조 - 마찬가지로 history는 안 남김."""
+        record = self._get_or_create(nickname)
+        if entity_id is not None:
+            record["entity_id"] = entity_id
+        record["item_level"] = item_level
+        record["item_level_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        self._save()
+        self._notify(nickname)
+
+    def delete_character(self, nickname):
+        """캐릭터 레코드를 완전히 삭제 (2026-07-19 추가, GUI의 "삭제" 버튼용). 되돌릴 방법이
+        없는 파괴적 동작이라 호출측(GUI)에서 사용자 확인을 먼저 받아야 한다. 삭제해도 그
+        캐릭터가 실제로 다시 접속해서 새 패킷이 오면(entity_id는 계정 공용이라 아직 추적
+        중이면) 레코드가 다시 자연스럽게 생성될 수 있음 - "다시는 못 보게 영구 차단"이 아니라
+        "지금 목록에서 안 보이게 지우기"에 가까운 동작. 존재하지 않는 닉네임이면 조용히
+        아무 것도 안 함(no-op), 호출측에서 미리 존재 여부를 확인할 필요 없게 함."""
+        if nickname in self.data:
+            del self.data[nickname]
+            self._save()
 
     OATH_ENERGY_BASE_CAP = 840  # 2026-07-09 추가: 왼쪽 숫자(기본 오드)의 게임 내 한도 (사용자 확인)
 
@@ -171,7 +249,8 @@ class CharacterStore:
         합산 불변식이 깨지지 않게 한다(그냥 amount를 그대로 더하면 총량만 840 초과분까지 따라
         올라가서 base/총량이 서로 안 맞게 됨).
         """
-        for record in self.data.values():
+        changed_nicknames = []
+        for nickname, record in self.data.items():
             base = record.get("oath_energy_base")
             if base is None:
                 continue
@@ -179,7 +258,94 @@ class CharacterStore:
             actual_added = new_base - base
             record["oath_energy_base"] = new_base
             record["oath_energy"] = (record.get("oath_energy") or 0) + actual_added
+            if actual_added > 0:
+                changed_nicknames.append(nickname)
         self._save()
+        # 2026-08-13 추가: 정기충전으로 바뀐 캐릭터도 서버 업로드 콜백 대상에 포함시킨다 -
+        # 안 그러면 서버 DB는 그 캐릭터가 다음에 실제로 접속할 때까지 정기충전분을 영영 못 받음
+        # (aion2_gui_qt.py의 "미접속캐릭 표시 안갱신" 버그와 같은 종류의 누락을 서버 쪽에서도
+        # 반복하지 않기 위함).
+        for nickname in changed_nicknames:
+            self._notify(nickname)
+
+    def catch_up_periodic_regen(self, amount, tick_hours):
+        """2026-07-18 추가: 프로그램이 꺼져있던 동안 놓친 정기충전을 실제 경과 시간 기준으로
+        한 번에 몰아서 계산해 적용한다 (사용자 제안: "15가 올라간 시간을 갱신날짜로 기록해놓고
+        exe가 스타트될때 그 갱신날짜를 기반으로 시간 계산을 한 다음 갱신 시켜놓으면 되는거
+        아닌가"). 기존 `apply_periodic_regen`은 "프로그램이 실제로 그 정각에 켜져 있어야만"
+        적용됐는데, 이 메서드는 그 제약이 없다 - 캐릭터별로 `oath_energy_regen_checkpoint`
+        (마지막으로 정기충전을 계산에 반영한 시각)를 기준으로 지금까지 `tick_hours` 정각이
+        몇 번 지났는지 세서 `amount * 횟수`를 한 번에 더한다(OATH_ENERGY_BASE_CAP으로 클램프,
+        apply_periodic_regen과 동일한 클램프 로직 - 총량엔 실제로 늘어난 만큼만 반영).
+
+        체크포인트가 아직 없는 레코드(이 기능 도입 전부터 있던 캐릭터, 또는 실측이 있었지만
+        아직 체크포인트가 안 찍힌 경우)는 `last_updated`(마지막 실측 시각)를 최초 기준점으로
+        삼는다 - 사용자 확정: "갱신 시간부터 소급하는 방향"(과거 전체 공백에 대해 소급 적용,
+        이번 기능 도입 시점부터만 카운트하는 보수적 방식은 채택 안 함). 실제 게임 서버는 우리
+        프로그램이 켜져 있는지와 무관하게 계속 충전해왔을 것이므로, 오래 방치된 캐릭터가 이
+        메서드 최초 실행 시 바로 상한(840) 근처로 점프하는 것은 버그가 아니라 의도된 동작이다.
+
+        체크포인트도 last_updated도 둘 다 없으면(한 번도 실측된 적 없는 캐릭터) 건너뛴다 -
+        base가 None인 레코드와 마찬가지로 기준으로 삼을 시각 자체가 없어서 계산이 불가능하다.
+
+        매 호출마다(변화가 있든 없든) 체크포인트를 지금 시각으로 갱신한다 - 그래야 다음 호출이
+        같은 구간을 또 세지 않는다. `update_oath_energy`가 실측 base를 받을 때도 체크포인트를
+        그 시각으로 맞춰두므로(위 참고), 실측과 이 시뮬레이션이 서로 같은 구간을 중복 가산하는
+        일은 없다.
+
+        **2026-07-18 추가(사용자 확정, "2번으로 가야지" - 값이 바뀌면 갱신날짜도 갱신하는
+        방향): 실제로 base가 증가했을 때(actual_added > 0)만 `last_updated`도 지금 시각으로
+        같이 갱신한다.** 원래(Fourteenth addition, apply_periodic_regen)는 정기충전이 "모든
+        캐릭터에 동시다발적으로 적용되는 이벤트라 실제 활동 시각과 혼동되면 안 된다"는 이유로
+        last_updated를 일부러 안 건드렸는데, 소급 캐치업이 추가되면서 한 번에 840까지 확
+        뛰는 큰 변화가 생길 수 있게 됐고, 그 옆에 GUI 갱신날짜가 여전히 옛날 그대로면 "값은
+        바뀌었는데 날짜는 왜 그대로냐"는 혼란을 준다는 사용자 지적으로 정책이 바뀜.
+        **"실제 플레이 시각" vs "정기충전 시각" 구분은 이 프로그램에서 애초에 의미가 없다고
+        사용자가 명시적으로 확인함("최근 실제 플레이라는게 의미가없어 오드만감시하는
+        프로그렘이니까")** - 이 프로그램은 플레이 세션을 추적하는 게 아니라 오드에너지 수치
+        자체만 감시하는 도구이므로, `most_recent_character()`가 "정기충전만 받은 캐릭터"를
+        골라도 문제로 취급하지 않는다. 즉 위에서 우려했던 트레이드오프는 실제로는 트레이드
+        오프가 아니다 - 그냥 "이 캐릭터 레코드가 마지막으로 갱신된 시각"으로 단순하게
+        취급하면 된다.
+
+        호출 지점(aion2_live_monitor.py): (1) 프로그램 시작 직후 1회 - 꺼져있던 동안의 공백을
+        메움, (2) 이후 매 정기충전 시각(2/5/8/11/14/17/20/23시)마다 - 기존 `_schedule_periodic_regen`
+        타이머가 그대로 호출하되 이제 `apply_periodic_regen` 대신 이 메서드를 씀(타이머가 살짝
+        늦게 발화하거나 절전모드 등으로 밀려도 실제 경과 틱 수를 정확히 세므로 더 견고함). 여전히
+        리플레이 모드(replay_pcap)에는 연결하지 않는다 - 리플레이는 과거 캡처 검증용이라 현재
+        벽시계 시각 기준 로직을 붙이면 검증 결과가 왜곡된다(위 apply_periodic_regen과 동일한 이유).
+        """
+        now = datetime.datetime.now()
+        changed_nicknames = []
+        for nickname, record in self.data.items():
+            base = record.get("oath_energy_base")
+            if base is None:
+                continue
+            checkpoint_str = record.get("oath_energy_regen_checkpoint") or record.get("last_updated")
+            if not checkpoint_str:
+                continue
+            try:
+                checkpoint = datetime.datetime.fromisoformat(checkpoint_str)
+            except ValueError:
+                continue
+            ticks = _count_ticks_since(checkpoint, now, tick_hours)
+            if ticks > 0:
+                new_base = min(base + amount * ticks, self.OATH_ENERGY_BASE_CAP)
+                actual_added = new_base - base
+                record["oath_energy_base"] = new_base
+                record["oath_energy"] = (record.get("oath_energy") or 0) + actual_added
+                if actual_added > 0:
+                    # 2026-07-18 추가(사용자 확정 "2번으로 가야지"): 실제로 값이 변했을 때만
+                    # last_updated도 같이 갱신 - GUI 갱신날짜와 실제 표시값이 어긋나 보이지
+                    # 않게 함. 위 docstring의 트레이드오프 설명 참고.
+                    record["last_updated"] = now.isoformat(timespec="seconds")
+                    changed_nicknames.append(nickname)
+            record["oath_energy_regen_checkpoint"] = now.isoformat(timespec="seconds")
+        self._save()
+        # 2026-08-13 추가: apply_periodic_regen과 동일한 이유 - 소급분도 서버 업로드 콜백을 태워야
+        # 서버 DB가 "오래 접속 안 한 캐릭터"를 다음 실접속까지 기다리지 않고 반영받는다.
+        for nickname in changed_nicknames:
+            self._notify(nickname)
 
     def most_recent_character(self):
         """oath_energy 가 채워진 레코드 중 last_updated 가 가장 최근인 닉네임을 반환.

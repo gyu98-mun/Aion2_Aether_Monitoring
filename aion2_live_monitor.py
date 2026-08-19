@@ -65,6 +65,7 @@ import types
 
 from aion2_core import StreamProcessor, StreamAssembler, LiveTcpReassembler
 from aion2_storage import CharacterStore
+import aion2_uploader  # 2026-08-13 추가, 2단계 서버 업로드 - server_config.json 없으면 전부 no-op
 
 # exe로 묶을 때(--noconsole/--windowed) 콘솔이 없으면 sys.stdout/stderr 가 None이 되어
 # print() 호출이 그대로 죽는다 (AttributeError: 'NoneType' object has no attribute 'write').
@@ -104,6 +105,58 @@ COMBAT_POWER_SNAPSHOT_GRACE = 0.6
 # (아래 _switch_epoch 참고) 아예 내보내지 않는다 - 정상적인(전환 없는) 상황에서는 사람이
 # 체감하기 힘든 짧은 지연이라 실시간성에 미치는 영향은 거의 없다.
 COMBAT_POWER_DISPLAY_DEBOUNCE = 0.4
+
+
+def _resolve_decrease_split(known_base, last_dynamic, new_total, status_queue):
+    """1값 감소 이벤트(opcode 0x0C,0x61, header1=0x08, delta 필드 없음)의 실제 총량(new_total)
+    으로부터 기본/추가 분할을 역산한다.
+
+    2026-08-08 두 번째 재정정(사용자 실측 확인): 오드에너지 소모는 기본오드를 먼저 깎고,
+    기본이 0이 된 뒤에야 추가오드가 깎이는 "기본-우선-소모" 순서다. 실측: 기본40/추가600
+    (총640) 상태에서 80 감소 -> 게임 화면에 찍힌 결과는 기본0/추가560 이었다(기본을
+    총 560으로 그대로 유지한 게 아니라, 기본이 먼저 40 전부 소진되고 남은 40이 추가에서
+    깎였다). 총량(560)만으로는 "기본 불변+추가만 -80" 해석과 "기본-우선-소모" 해석이
+    산술적으로 구분이 안 됐지만(둘 다 총 560), 사용자가 게임 화면에서 직접 확인한 개별
+    기본/추가 숫자(0/560)로 후자가 맞다는 게 확정됐다.
+
+    같은 날 오전에 이 메커니즘 자체를 구현했다가 되돌린 적이 있는데([[aion2_packet_reverse_engineering]]
+    "REVERTED" 섹션 참고), 그건 메커니즘이 틀려서가 아니라 구현이 틀려서였다 - 그때는
+    패킷값을 무조건 "새 기본"으로 통째로 대입해버려서 감소량이 기본보다 작을 때도 완전히
+    틀린 값이 들어갔고, 게다가 정기충전(+15/3h) 시뮬레이션이 known_base를 허위로 계속
+    부풀려서 이 분기가 정상적인 순수-추가오드 소모까지 잘못 가로챘다. 이번엔 (a) known_base/
+    last_dynamic으로 실제 감소량을 역산해서 기본부터 정확히 그만큼만 깎고 남으면 추가로
+    넘기는 올바른 드레인 계산을 쓰고, (b) 정기충전 시뮬레이션이 이미 죽은코드로 격리되어
+    known_base가 더 이상 허위로 부풀지 않는다는 전제 위에서 동작한다.
+
+    반환: (new_known_base, new_dynamic).
+    """
+    if last_dynamic is None:
+        # 이번 세션 첫 이벤트라 직전 상태(baseline)를 몰라 드레인 계산이 불가능 - 기존처럼
+        # 기본은 그대로 두고 총량에서 역산(재정정 1차 수정과 동일 폴백).
+        dynamic = new_total - known_base
+        if dynamic < 0:
+            status_queue.put(
+                f"[의심] 새총량({new_total})에서 기본({known_base})을 뺐더니 "
+                f"추가오드가 음수({dynamic}) - known_base가 오래됐을 수 있음"
+            )
+        return known_base, dynamic
+
+    old_total = known_base + last_dynamic
+    decrease_amount = old_total - new_total
+    if decrease_amount < 0:
+        # "감소" 서브타입인데 총량이 오히려 늘어남 - known 상태가 오래됐다는 신호. 드레인
+        # 계산의 전제(old_total이 정확함)가 깨졌으므로, 패킷을 신뢰하고 기존 폴백으로 처리.
+        status_queue.put(
+            f"[의심] 감소 이벤트인데 총량이 오히려 증가함(구총량{old_total}->신총량{new_total}) "
+            f"- known 상태가 오래됐을 수 있음"
+        )
+        return known_base, new_total - known_base
+    if decrease_amount <= known_base:
+        # 감소량이 기본만으로 전부 흡수됨 - 추가오드는 안 건드림.
+        return known_base - decrease_amount, last_dynamic
+    # 기본을 다 쓰고도 모자라 추가까지 넘어감 - 기본은 0, 나머지는 전부 추가오드에 반영된
+    # 새 총량 그 자체(기본이 0이므로 총량=추가오드).
+    return 0, new_total
 
 
 def parse_network(spec):
@@ -186,7 +239,14 @@ class LiveCapture:
         self.matched_packet_count = 0
         self.first_packet_seen = False
         self.last_dynamic = None  # 직전에 확인된 "오른쪽 숫자"(누적분, delta 필드 없는 패킷용)
-        self.store = CharacterStore()  # 캐릭터별 오드에너지 로컬 저장소 (oath_energy_data.json, 닉네임 키)
+        # 2026-08-13 추가: on_change 콜백으로 aion2_uploader.enqueue_upload를 연결한다 - 서버가
+        # 설정 안 돼있으면(server_config.json 없음/server_url 빈값) enqueue_upload 자체가
+        # 조용히 no-op이므로, 이 줄은 서버 기능을 안 쓰는 기존 사용자에게 아무 영향도 없다.
+        # replay_pcap은 이 콜백을 넘기지 않음 - 리플레이가 실제 네트워크 부작용을 내면 안 됨
+        # (정기충전을 replay에 안 붙인 것과 같은 원칙, aion2_project_roadmap 참고).
+        self.store = CharacterStore(
+            on_change=lambda record: aion2_uploader.enqueue_upload(record, status_queue)
+        )  # 캐릭터별 오드에너지 로컬 저장소 (oath_energy_data.json, 닉네임 키)
 
         # 2026-07-08: 저장소가 닉네임 키로 바뀌면서, "지난 세션에 마지막으로 활동한 캐릭터"를
         # 이어받아 콜드스타트를 완화한다. entity_id/base는 패킷 신뢰 검증과 총량 계산용 참고값일
@@ -211,6 +271,7 @@ class LiveCapture:
             on_unknown=self._on_unknown if self.debug else None,
             get_known_oath_id=lambda: self.known_oath_id,
             on_combat_power=self._on_combat_power,
+            on_item_level=self._on_item_level,
         )
         assembler = StreamAssembler(proc)
         self.live_reassembler = LiveTcpReassembler(assembler)
@@ -248,6 +309,13 @@ class LiveCapture:
                 f"달라서 무시됨: id={ev.entity_id} total={ev.new_total}"
             )
             return
+
+        # 2026-08-08 두 번째 재정정: 아래에서 known_base/last_dynamic이 바뀌기 전의 "이전 상태"를
+        # 미리 저장해둔다 - delta를 "추가오드만의 변화량"이 아니라 "총량의 변화량"으로 계산하기
+        # 위함(기본-우선-소모로 기본만 깎이고 추가는 안 바뀌는 경우, 예전 방식(dynamic 차이만
+        # 보는 것)으로는 실제로 소모가 있었는데도 delta=0으로 잘못 나온다).
+        prev_base = self.known_base
+        prev_dynamic = self.last_dynamic
 
         # 2026-07-07 추가: "왼쪽 숫자"(정기 충전분, base) + "오른쪽 숫자"(누적분, dynamic) 합산 버그 수정.
         # 스냅샷 이벤트는 base/dynamic 을 둘 다 직접 주므로 그대로 반영. 일반 변경 이벤트는 dynamic 만
@@ -304,10 +372,29 @@ class LiveCapture:
                 self.known_base = ev.base
                 dynamic = ev.dynamic
             else:
-                dynamic = ev.new_total
+                # 2026-08-08 재정정: 1값 형식(header1=0x08)의 값은 "새 추가오드"가 아니라
+                # "새 총량"이다(기본40/추가600에서 80감소 시 패킷값 560=640-80 실측 확인).
+                # 자세한 경위는 [[aion2_packet_reverse_engineering]] 참고.
+                if ev.delta is None:
+                    # 감소: 기본-우선-소모 메커니즘 반영 (같은 날 두 번째 재정정, 실측
+                    # 기본0/추가560 확인) - _resolve_decrease_split 문서 참고.
+                    self.known_base, dynamic = _resolve_decrease_split(
+                        self.known_base, self.last_dynamic, ev.new_total, self.status_queue,
+                    )
+                else:
+                    # 증가: 기본을 우선 채우는지는 아직 실측 확인 안 됨 - 기본은 그대로 두고
+                    # 총량에서 역산하는 기존 방식 유지.
+                    dynamic = ev.new_total - self.known_base
+                    if dynamic < 0:
+                        self.status_queue.put(
+                            f"[의심] 새총량({ev.new_total})에서 기본({self.known_base})을 뺐더니 "
+                            f"추가오드가 음수({dynamic}) - known_base가 오래됐을 수 있음"
+                        )
 
-        if ev.delta is None and self.last_dynamic is not None:
-            ev.delta = dynamic - self.last_dynamic
+        if ev.delta is None and prev_dynamic is not None:
+            # 총량 기준 변화량(2026-08-08 두 번째 재정정) - 기본만 깎이고 추가는 안 바뀐
+            # 경우에도 실제 소모량이 delta에 정확히 반영된다.
+            ev.delta = (self.known_base + dynamic) - (prev_base + prev_dynamic)
         self.last_dynamic = dynamic
         ev.new_total = self.known_base + dynamic
 
@@ -345,6 +432,15 @@ class LiveCapture:
                 )
                 pending_cp.pop("combat_power", None)
                 pending_cp.pop("combat_power_updated", None)
+            # 2026-07-19 추가: 템레벨(item_level)도 combat_power와 완전히 같은 이유로
+            # pending_oath에 보류됐다가 여기서(오드에너지 이벤트가 이 캐릭터인 걸 확정하는
+            # 시점) 같이 반영된다 - 같은 pending_cp 딕셔너리를 그대로 재사용.
+            if pending_cp and pending_cp.get("item_level") is not None:
+                self.store.update_item_level(
+                    self.current_nickname, pending_cp["item_level"], entity_id=ev.entity_id,
+                )
+                pending_cp.pop("item_level", None)
+                pending_cp.pop("item_level_updated", None)
             ev.display_name = self.current_nickname
             ev.record = dict(self.store.data.get(self.current_nickname, {}))
         else:
@@ -416,6 +512,11 @@ class LiveCapture:
                 if pending.get("combat_power") is not None:
                     self.store.update_combat_power(
                         ev.nickname, pending["combat_power"], entity_id=self.known_oath_id,
+                    )
+                # 2026-07-19 추가: 템레벨도 닉네임 확인 시점에 같이 플러시 (combat_power와 동일 이유).
+                if pending.get("item_level") is not None:
+                    self.store.update_item_level(
+                        ev.nickname, pending["item_level"], entity_id=self.known_oath_id,
                     )
             record_snapshot = dict(self.store.data.get(ev.nickname, {}))
             self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
@@ -496,6 +597,41 @@ class LiveCapture:
                 self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
             threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid).start()
+        else:
+            record_snapshot = {"entity_id": self.known_oath_id, "nickname": None, **pending}
+            self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+
+    def _on_item_level(self, ev):
+        """템레벨(opcode 0x1D,0x56) 갱신 - _on_combat_power와 완전히 같은 이유로 같은 구조를
+        그대로 따른다: entity_id가 없는 패킷이라 "본인" 것으로 간주하고 known_oath_id에 붙이며,
+        캐릭터 전환 시 오염을 막기 위해 (a) 닉네임 미확인 상태에선 로그인 스냅샷 직후
+        COMBAT_POWER_SNAPSHOT_GRACE(같은 유예 구간을 재사용 - 템레벨도 로그인 시점에 같이 오는
+        정보라 같은 타이밍 특성을 가짐) 이내만 신뢰하고, (b) 실제 저장은 절대 즉시 하지 않고
+        pending_oath에 담아뒀다가 오드에너지 이벤트/닉네임 확인 시점에만 반영한다
+        (_on_oath_energy/_on_nickname의 item_level 플러시 참고).
+
+        2026-07-19 발견 - 실측 캡처 1건("활성성 템레벨 5529 테스트.pcapng")으로만 확인됨,
+        combat_power 만큼 여러 번 교차검증되지 않았으므로 화면 표시 디바운스(전환 직전 잔상
+        방지)는 아직 적용 안 함 - 필요하면(실제로 전환 시 잔상이 관측되면) combat_power와
+        동일하게 COMBAT_POWER_DISPLAY_DEBOUNCE를 적용할 것.
+        """
+        if self.known_oath_id is None:
+            return
+        if self.current_nickname is None:
+            now = ev.arrived_at if ev.arrived_at is not None else time.time()
+            if self.combat_power_grace_until is None or now > self.combat_power_grace_until:
+                return
+            self.status_queue.put(
+                f"[유예구간] 닉네임 미확인 상태지만 스냅샷 직후라 템레벨 신뢰: {ev.item_level}"
+            )
+        pending = self.pending_oath.setdefault(self.known_oath_id, {})
+        pending["item_level"] = ev.item_level
+        pending["item_level_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        if self.current_nickname:
+            record_snapshot = {**dict(self.store.data.get(self.current_nickname, {})),
+                               "item_level": ev.item_level,
+                               "item_level_updated": pending["item_level_updated"]}
+            self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
         else:
             record_snapshot = {"entity_id": self.known_oath_id, "nickname": None, **pending}
             self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
@@ -686,6 +822,11 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
             )
             return
 
+        # LiveCapture._on_oath_energy 와 동일한 이유로 이전 상태 저장 (2026-08-08 두 번째 재정정) -
+        # delta를 "총량의 변화량"으로 계산하기 위함.
+        prev_base = known["base"]
+        prev_dynamic = last_dynamic_holder["v"]
+
         if getattr(ev, "is_snapshot", False):
             known["base"] = getattr(ev, "base", 0) or 0
             dynamic = getattr(ev, "dynamic", ev.new_total)
@@ -712,10 +853,23 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 known["base"] = ev.base
                 dynamic = ev.dynamic
             else:
-                dynamic = ev.new_total
+                # LiveCapture._on_oath_energy 와 완전히 동일한 이유로 수정 (2026-08-08 재정정,
+                # 및 같은 날 두 번째 재정정: 기본-우선-소모 드레인 계산) - _resolve_decrease_split
+                # 문서 참고.
+                if ev.delta is None:
+                    known["base"], dynamic = _resolve_decrease_split(
+                        known["base"], last_dynamic_holder["v"], ev.new_total, status_queue,
+                    )
+                else:
+                    dynamic = ev.new_total - known["base"]
+                    if dynamic < 0:
+                        status_queue.put(
+                            f"[의심] 새총량({ev.new_total})에서 기본({known['base']})을 뺐더니 "
+                            f"추가오드가 음수({dynamic}) - known_base가 오래됐을 수 있음"
+                        )
 
-        if ev.delta is None and last_dynamic_holder["v"] is not None:
-            ev.delta = dynamic - last_dynamic_holder["v"]
+        if ev.delta is None and prev_dynamic is not None:
+            ev.delta = (known["base"] + dynamic) - (prev_base + prev_dynamic)
         last_dynamic_holder["v"] = dynamic
         ev.new_total = known["base"] + dynamic
 
@@ -747,6 +901,13 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 )
                 pending_cp.pop("combat_power", None)
                 pending_cp.pop("combat_power_updated", None)
+            # 2026-07-19 추가: 템레벨도 combat_power와 동일한 이유로 여기서 같이 반영.
+            if pending_cp and pending_cp.get("item_level") is not None:
+                store.update_item_level(
+                    current["nickname"], pending_cp["item_level"], entity_id=ev.entity_id,
+                )
+                pending_cp.pop("item_level", None)
+                pending_cp.pop("item_level_updated", None)
             ev.display_name = current["nickname"]
             ev.record = dict(store.data.get(current["nickname"], {}))
         else:
@@ -785,6 +946,9 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                     )
                 if pending.get("combat_power") is not None:
                     store.update_combat_power(ev.nickname, pending["combat_power"], entity_id=known["id"])
+                # 2026-07-19 추가: 템레벨도 닉네임 확인 시점에 같이 플러시.
+                if pending.get("item_level") is not None:
+                    store.update_item_level(ev.nickname, pending["item_level"], entity_id=known["id"])
             record_snapshot = dict(store.data.get(ev.nickname, {}))
             event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
 
@@ -839,9 +1003,37 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
             record_snapshot = {"entity_id": known["id"], "nickname": None, **pending}
             event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
+    def on_item_level(ev):
+        # LiveCapture._on_item_level과 완전히 동일한 구조 (2026-07-19 추가) - 자세한 이유는
+        # 그쪽 docstring 참고.
+        if known["id"] is None:
+            return
+        if current["nickname"] is None:
+            now = ev.arrived_at if ev.arrived_at is not None else 0
+            grace = known.get("cp_grace_until")
+            if grace is None or now > grace:
+                return
+            status_queue.put(
+                f"[유예구간] 닉네임 미확인 상태지만 스냅샷 직후라 템레벨 신뢰: {ev.item_level}"
+            )
+        pending = pending_oath.setdefault(known["id"], {})
+        pending["item_level"] = ev.item_level
+        pending["item_level_updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+        if current["nickname"]:
+            record_snapshot = {
+                **dict(store.data.get(current["nickname"], {})),
+                "item_level": ev.item_level,
+                "item_level_updated": pending["item_level_updated"],
+            }
+            event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+        else:
+            record_snapshot = {"entity_id": known["id"], "nickname": None, **pending}
+            event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
+
     proc = StreamProcessor(on_oath_energy=on_oath, on_nickname=on_nickname,
                             get_known_oath_id=lambda: known["id"],
-                            on_combat_power=on_combat_power)
+                            on_combat_power=on_combat_power,
+                            on_item_level=on_item_level)
     assembler = StreamAssembler(proc)
     live = LiveTcpReassembler(assembler)
 
@@ -910,7 +1102,7 @@ def _fmt_combat_power_cell(value):
 STATUS_ROW_CAP = 100  # 표에 유지할 최대 캐릭터 수 (그 이상이면 가장 오래 안 갱신된 것부터 정리)
 
 
-def run_gui(event_queue, status_queue):
+def run_gui(event_queue, status_queue, opacity=0.88):
     import tkinter as tk
     from tkinter import ttk
 
@@ -925,6 +1117,20 @@ def run_gui(event_queue, status_queue):
     root.geometry("460x520")
     root.minsize(360, 360)
     root.configure(bg=BG)
+
+    # 2026-07-18 추가: 반투명 창(사용자 요청, 다른 DPS미터류 오버레이 참고 이미지 제공 -
+    # 배경이 게임 화면 위에 은은하게 비치는 느낌). Tkinter의 -alpha는 창 전체(배경+글자+표)를
+    # 균일하게 반투명 처리하는 방식(Windows layered window의 상수 알파 블렌딩) - 배경만
+    # 완전히 투명하게 뚫고 글자만 선명하게 남기는 진짜 오버레이 방식(-transparentcolor, 특정
+    # 색만 완전 투명/클릭통과)과는 다르다. 사용자가 보여준 참고 이미지(다른 DPS미터 오버레이)는
+    # 어두운 패널이 게임 배경과 옅게 섞여 보이는 형태라 -alpha 쪽이 더 가까운 느낌이라 이걸로
+    # 구현함 - 대신 텍스트/표 글자도 배경과 함께 살짝 비쳐 보인다(참고 이미지처럼 글자만
+    # 완전히 또렷하진 않음). 0.3~1.0 사이로 클램프(너무 낮으면 창이 사실상 안 보여서 조작
+    # 자체가 불가능해지는 걸 방지). --opacity CLI 옵션으로 조절 가능(main() 참고, 기본 0.88).
+    try:
+        root.attributes("-alpha", max(0.3, min(1.0, opacity)))
+    except tk.TclError:
+        pass  # 일부 환경(리눅스 특정 창관리자 등)에서 -alpha 미지원일 수 있음 - 조용히 무시
 
     value_var = tk.StringVar(value="대기 중...")
     delta_var = tk.StringVar(value="아이템을 사용하거나 캐릭터로 접속하면 표시됩니다")
@@ -1160,6 +1366,15 @@ def run_console(event_queue, status_queue):
 
     while True:
         ev = event_queue.get()
+        # 2026-07-18 추가: GUI 모드(poll_queue)는 2026-07-09에 추가된 forget_entity_id
+        # SimpleNamespace 이벤트(캐릭터 전환 감지 시 GUI 닉네임 캐시 무효화용, delta 필드 없음)를
+        # 처리하지만 콘솔 모드(run_console)는 그때 같이 안 고쳐져서 이 이벤트를 받으면
+        # `ev.delta` 접근에서 AttributeError로 그대로 죽었다("살육성 오드0 실험.pcapng" 리플레이
+        # 검증 중 실제로 재현됨, --no-gui 모드 전용 크래시라 GUI 모드에서는 안 드러났었음).
+        forget_id = getattr(ev, "forget_entity_id", None)
+        if forget_id is not None:
+            print(f"[알림] entity_id={forget_id} 닉네임 캐시 초기화 (캐릭터 전환 감지)")
+            continue
         name = getattr(ev, "display_name", None) or "캐릭터"
         if ev.delta is None:
             print(f"[오드에너지] {name}  총량={ev.new_total}  변화=알 수 없음(최초 값)")
@@ -1200,7 +1415,7 @@ def _schedule_periodic_regen(store, status_queue):
     오드)를 실제 패킷 없이 자동으로 +15 해준다 (사용자 요청, 2026-07-09) - "우리 프로그램이
     돌고있는동안 2시 5시 8시 11시 오전 오후로 15씩 증가하는 로직은 추가할수 있지 않아?".
 
-    실측값과 필드 상 구분하지 않고 그대로 합산한다(CharacterStore.apply_periodic_regen 참고,
+    실측값과 필드 상 구분하지 않고 그대로 합산한다(CharacterStore.catch_up_periodic_regen 참고,
     사용자 확정: "구분 없이 그냥 합산해서 json에 담아 넣는데 대신 시간마다 증가되는 오드는
     추가 오드가 아닌 기본(왼쪽)오드"). 다음에 실제 로그인/이 문서의 [[Thirteenth bug]] 2값
     변형 이벤트 등으로 진짜 값이 확인되면 그 값이 그대로 덮어써지므로 자연히 보정된다.
@@ -1209,15 +1424,23 @@ def _schedule_periodic_regen(store, status_queue):
     모드(replay_pcap)에는 연결하지 않는다. 리플레이는 과거 캡처 재생/검증용이라 지금 이 순간의
     실제 벽시계 시각 기준 정기 충전을 적용하면 검증 결과가 왜곡된다.
 
-    프로그램을 껐다 켠 사이에 지나간 정기 충전은 소급 적용하지 않는다 - 다음 예약 시각은
-    항상 "지금 이후 가장 가까운 시각"으로 계산되므로, 꺼져 있던 동안의 충전은 놓친다(다음
-    실제 로그인 시 정확한 값으로 보정되므로 큰 문제는 아니라고 판단).
+    **2026-07-18 수정: 프로그램을 껐다 켠 사이에 지나간 정기 충전도 이제 소급 적용된다.**
+    예전엔 다음 예약 시각을 항상 "지금 이후 가장 가까운 시각"으로만 계산해서 꺼져있던 동안의
+    충전을 그냥 놓쳤는데, 사용자가 "15가 올라간 시간을 갱신날짜로 기록해놓고 exe가 스타트될때
+    그 갱신날짜를 기반으로 시간 계산을 한 다음 갱신 시켜놓으면 되는거 아니냐"고 제안 - 실제
+    서버는 우리 프로그램 실행 여부와 무관하게 계속 충전해왔을 것이므로 타당한 지적이라 반영함.
+    `CharacterStore.catch_up_periodic_regen()`이 캐릭터별 체크포인트 기준으로 지난 정기충전
+    횟수를 세서 한 번에 몰아 적용한다 - 이 함수는 이제 그 메서드를 매 예약 시각마다 호출하는
+    역할만 하고(기존 타이머 스케줄 유지, 3시간마다 재예약), 실제 소급/적용 로직은
+    `catch_up_periodic_regen`에 있다. 프로그램 시작 직후에도 별도로 한 번 호출해서(main() 참고)
+    꺼져있던 동안의 공백을 즉시 메운다.
     """
     def _fire():
         try:
-            store.apply_periodic_regen(PERIODIC_REGEN_AMOUNT)
+            store.catch_up_periodic_regen(PERIODIC_REGEN_AMOUNT, PERIODIC_REGEN_HOURS)
             status_queue.put(
-                f"[정기충전] 저장된 모든 캐릭터의 왼쪽 숫자(기본 오드)에 +{PERIODIC_REGEN_AMOUNT} 추정 반영"
+                f"[정기충전] 저장된 모든 캐릭터의 왼쪽 숫자(기본 오드)에 +{PERIODIC_REGEN_AMOUNT}"
+                f"(경과분 소급 포함) 추정 반영"
             )
         except Exception as e:
             status_queue.put(f"[정기충전][에러] 적용 실패: {e!r}")
@@ -1226,6 +1449,32 @@ def _schedule_periodic_regen(store, status_queue):
     next_time = _next_periodic_regen_time()
     delay = max((next_time - datetime.datetime.now()).total_seconds(), 1.0)
     threading.Timer(delay, _fire).start()
+
+
+def _start_periodic_regen(capture, status_queue):
+    """정기 충전(+15, 3시간마다) 시뮬레이션을 실제로 켜는 진입점 - 시작 시 소급 반영 1회 +
+    3시간 주기 재예약(_schedule_periodic_regen)까지 묶어서 여기 하나로 격리했다 (2026-08-08,
+    원래 main() 안에 인라인으로 있던 코드를 그대로 옮긴 것).
+
+    **2026-08-08~2026-08-13: 죽은 코드였다가 재활성화됨.** 2026-08-08에 사용자 요청으로 격리:
+    "3시간마다 기본오드 15충전로직 제대로 동작도 못하는데 일단 따로 함수로 묶여서
+    격리시켜두고 죽은코드로 만들어둬 나중에 정리한다". 계기: 이 시뮬레이션이 실제 패킷과
+    무관하게 known_base를 계속 올려버리는 부작용이 있어서(오래 켜둘수록 거의 모든 캐릭터가
+    known_base>0 상태가 됨), 같은 날 있었던 "기본-우선-소모" 분기 시도(당시 known_base>0이면
+    감소 패킷 원값을 그대로 base에 덮어씀)가 이것 때문에 실사용에서 회귀를 냈다(memory의
+    aion2_packet_reverse_engineering.md "REVERTED" 절 참고).
+
+    이후 그 분기가 `_resolve_decrease_split()`로 완전히 재구현되어 known_base의 절대적 크기가
+    아니라 (old_total-new_total)로 역산한 정확한 소모량만 base에서 차감하는 방식으로
+    바뀌었으므로, 2026-08-12 사용자 결정에 따라 2026-08-13 main()에서 다시 호출하도록
+    재활성화함(memory "Decision: re-enable the periodic-regen dead code next session" 참고).
+    """
+    try:
+        capture.store.catch_up_periodic_regen(PERIODIC_REGEN_AMOUNT, PERIODIC_REGEN_HOURS)
+        status_queue.put("[정기충전] 시작 시 경과분 소급 반영 완료")
+    except Exception as e:
+        status_queue.put(f"[정기충전][에러] 시작 시 소급 반영 실패: {e!r}")
+    _schedule_periodic_regen(capture.store, status_queue)
 
 
 def main():
@@ -1240,6 +1489,8 @@ def main():
                          help="리플레이 재생 속도 배율 (0=최대한 빠르게, 1=원래 속도)")
     parser.add_argument("--no-gui", action="store_true", help="GUI 없이 콘솔 출력만")
     parser.add_argument("--debug", action="store_true", help="디버그 상태 메시지 출력 (수신 패킷 수 등)")
+    parser.add_argument("--opacity", type=float, default=0.88,
+                         help="GUI 창 반투명도, 0.3~1.0 (1.0=완전 불투명, 기본 0.88) - 2026-07-18 추가")
     args = parser.parse_args()
 
     if args.list_ifaces:
@@ -1271,21 +1522,42 @@ def main():
                                iface=args.iface, debug=args.debug)
         capture.start()
         print(f"실시간 캡처 시작: {server_net}:{args.port} (관리자 권한 필요)")
-        # 2026-07-09 추가: 실시간 캡처 모드에서만 정기 충전 추정 스케줄러를 켠다 (리플레이는
-        # 과거 캡처 검증용이라 현재 벽시계 시각 기준 로직을 붙이면 안 됨). LiveCapture가 이미
-        # 만들어둔 store 인스턴스를 그대로 재사용 - 별도 CharacterStore를 새로 만들면 두
-        # 인스턴스가 서로 다른 시점의 메모리 상태로 각자 파일에 저장하면서 상대방의 변경을
-        # 덮어쓰는 경쟁이 생길 수 있다.
-        _schedule_periodic_regen(capture.store, status_queue)
+        # 2026-08-13: 정기 충전(+15, 3시간마다) 시뮬레이션 재활성화 (사용자 결정, 2026-08-12
+        # memory "Decision: re-enable the periodic-regen dead code next session" 참고).
+        # 2026-08-08에 격리(죽은코드화)했던 이유는 당시 known_base>0이면 감소 패킷의 원값을
+        # 그대로 base에 덮어쓰는 별개의 버그("기본-우선-소모" 1차 시도)가 정기충전 때문에
+        # 상시 발동해 정상적인 dynamic-only 소모까지 망가뜨렸기 때문 (memory의
+        # aion2_packet_reverse_engineering.md "REVERTED" 절 참고). 그 버그는 이후
+        # _resolve_decrease_split()로 완전히 다른 방식(정확한 소모량을 old_total-new_total로
+        # 역산 후 base부터 차감)으로 재구현되어 known_base의 절대값 크기에 더 이상 의존하지
+        # 않으므로, 정기충전이 known_base를 올려도 같은 회귀가 재발하지 않을 것으로 판단됨.
+        _start_periodic_regen(capture, status_queue)
 
     if args.no_gui:
         run_console(event_queue, status_queue)
     else:
+        # 2026-07-18 추가: PySide6(Qt) 기반 새 GUI(aion2_gui_qt.py)를 먼저 시도한다 -
+        # 사용자가 참고 이미지를 보여주며 "전체 디자인까지 이 느낌으로 재단장"을 요청,
+        # PySide6로 전체 재작성하기로 확정함(AskUserQuestion). 여기서 지연 임포트하는 이유:
+        # aion2_gui_qt.py가 모듈 최상단에서 이 파일(aion2_live_monitor)의 포맷터 함수/
+        # STATUS_ROW_CAP을 가져다 쓰는데, main() 안에서 임포트하면 그 시점엔 이 파일이
+        # 이미 다 로드된 뒤라 순환 참조가 안 생긴다. PySide6 미설치거나 실행 중 에러가 나면
+        # 기존 Tkinter GUI(run_gui)로, 그것도 실패하면 콘솔 모드로 2단계 폴백한다.
         try:
-            run_gui(event_queue, status_queue)
+            from aion2_gui_qt import run_gui_qt
+            # 2026-07-19 수정: 삭제 버튼 기능을 위해 GUI가 자기만의 CharacterStore를 새로
+            # 만들지 않고 LiveCapture가 이미 갖고 있는 capture.store를 그대로 공유하게 함 -
+            # 주기적 오드 재생 스케줄러(_schedule_periodic_regen)가 같은 이유로 capture.store를
+            # 재사용하는 것과 동일한 패턴. 두 인스턴스가 따로 놀면 삭제해도 LiveCapture 쪽의
+            # 옛 메모리 상태가 다음 저장 때 되살려버리는 문제가 생긴다.
+            run_gui_qt(event_queue, status_queue, opacity=args.opacity, store=capture.store)
         except Exception as e:
-            print(f"GUI 실행 실패 ({e}), 콘솔 모드로 전환합니다.")
-            run_console(event_queue, status_queue)
+            print(f"PySide6 GUI 실행 실패 ({e}), 기존 Tkinter GUI로 전환합니다.")
+            try:
+                run_gui(event_queue, status_queue, opacity=args.opacity)
+            except Exception as e2:
+                print(f"GUI 실행 실패 ({e2}), 콘솔 모드로 전환합니다.")
+                run_console(event_queue, status_queue)
 
 
 if __name__ == "__main__":

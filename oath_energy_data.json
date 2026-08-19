@@ -76,5 +76,18 @@
     "last_updated": "2026-07-08T03:10:55",
     "combat_power": 404618,
     "combat_power_updated": "2026-07-08T03:10:55"
+  },
+  "살육성": {
+    "nickname": "살육성",
+    "entity_id": 51591,
+    "server": 1002,
+    "job": 18,
+    "oath_energy": null,
+    "oath_energy_base": null,
+    "oath_energy_dynamic": null,
+    "last_delta": null,
+    "last_updated": null,
+    "combat_power": null,
+    "combat_power_updated": null
   }
 }

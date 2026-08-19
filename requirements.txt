@@ -1,3 +1,5 @@
 scapy
 lz4
 pyinstaller
+PySide6
+requests

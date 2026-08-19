@@ -24,6 +24,7 @@ OATH_ENERGY_OPCODE = (0x0C, 0x61)
 OWN_NICKNAME_OPCODE = (0x33, 0x36)  # 참고: TK-open-public/Aion2-Dps-Meter PropertyHandler.kt searchOwnNickname
 OWN_STATS_SNAPSHOT_OPCODE = (0x0B, 0x61)  # 로그인/월드 진입 시 1회 오는 "전체 스탯 동기화" 패킷
 COMBAT_POWER_OPCODE = (0x56, 0x36)  # 전투력 갱신 패킷 (2026-07-08, "전투력 변화 캡쳐.pcapng"로 확인)
+ITEM_LEVEL_OPCODE = (0x1D, 0x56)  # 템레벨 갱신 패킷 (2026-07-19, "활성성 템레벨 5529 테스트.pcapng"로 확인)
 
 
 class VarInt:
@@ -49,6 +50,23 @@ def read_varint(b: bytes, offset: int = 0) -> VarInt:
         shift += 7
         if shift >= 32:
             return VarInt(-1, -1)
+
+
+def _encode_varint(value: int) -> bytes:
+    """`read_varint`의 인코딩을 그대로 반대로 - 특정 known_id를 페이로드에서 정확히 바이트
+    매칭으로 찾을 때 씀 (2026-07-18 추가, `parse_own_stats_snapshot_payload`의 세 번째 형태
+    검색에서 사용)."""
+    out = bytearray()
+    v = value
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
 
 
 class OathEnergyEvent:
@@ -225,6 +243,18 @@ def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):
     있으므로, 이 형태로 찾은 후보는 known_id와 일치할 때만 신뢰하도록 호출측에서 추가 검증하는 게
     안전하다 (aion2_live_monitor.py의 `_is_trusted_oath_event`가 이미 델타 없는 이벤트에 대해 이
     역할을 하고 있음 - 로그인 스냅샷은 delta=None 이라 그 검증을 그대로 통과함).
+
+    **세 번째 형태 추가 (2026-07-18, "살육성 기본오드15/30 추가오드0 테스트.pcapng" 2건 +
+    "살육성 오드0 실험.pcapng"와의 3점 비교로 확정):** dynamic(추가오드)=0인 캐릭터는 위 두
+    마커 자리에 아무것도 없고, 대신 known_id의 varint 바이트열 바로 앞에 판별 바이트가 붙는
+    전혀 다른 레코드를 쓴다 - `[판별=0x00][0x01][varint id][단일 값(정체불명 상수, 실측 항상
+    4, base와 무관)]`(base=0 암묵적) 또는 `[판별=0x04][0x01][varint id][varint base][그 상수]`
+    (base=15/30으로 각각 정확히 일치 확인). dynamic은 이 레코드로는 알 수 없어 0으로 둔다 -
+    dynamic이 0이 아니면서 이 형태를 쓰는 조합은 아직 관측된 적 없다(그 경우는 (1)번 `0c 01`
+    마커가 정상 커버하는 것으로 보임 - 궁예성/마술성/성령성 모두 dynamic≠0이었고 그걸로 인식됨).
+    오탐 방지를 위해 known_id가 있을 때만(정확한 varint 바이트 일치로 앵커링) 검색한다 -
+    known_id 없는 콜드스타트에선 이 형태를 못 잡는다(Seventeenth bug의 "완전히 0" 폴백과
+    동일한 한계).
     """
     candidates = []
 
@@ -267,7 +297,60 @@ def parse_own_stats_snapshot_payload(payload: bytes, known_id=None):
                     candidates.append((id_vi.value, 0, total_vi.value, total_vi.value))
         search_start = idx + 1
 
+    # (3) 2026-07-18 추가: dynamic(추가오드)=0인 캐릭터가 쓰는 세 번째 형태 - "살육성 기본오드15
+    # 추가오드0 테스트.pcapng"/"...기본오드30..." 두 캡처를 "완전히 0"인 캡처(Seventeenth bug
+    # 섹션 참고)와 3점 비교로 확정. 이 형태는 위 두 마커(`0c 01`, `00 08 01`)가 있는 자리가
+    # 아니라 known_id의 varint 바이트열 바로 앞에 "판별 바이트"가 붙는 별도 레코드다:
+    #   판별 바이트=0x00 → `[0x00][0x01][varint id][단일 값]` - 뒤따르는 단일 값은 실측 3회
+    #     모두 4로 고정(무슨 필드인지 불명, base와 무관 - 무시), base는 이 형태에선 암묵적 0.
+    #   판별 바이트=0x04 → `[0x04][0x01][varint id][varint base][단일 값]` - 첫 번째 값이
+    #     base(실측: 15, 30 정확히 일치), 두 번째 값은 역시 그 정체불명 상수 4(무시).
+    # dynamic은 이 레코드에서 전혀 알 수 없다 - 실측 3회 전부 dynamic=0인 경우만 확인됐으므로
+    # 0으로 둔다. dynamic이 0이 아니면서 이 판별-바이트 형태를 쓰는 조합은 아직 관측된 적
+    # 없다(다른 조합에선 기존 (1)번 `0c 01` 2값 마커가 그대로 쓰이는 것으로 보임 - 궁예성/
+    # 마술성/성령성 캡처 모두 dynamic이 0이 아니었고 그 마커로 정상 인식됐음).
+    # known_id가 있을 때만 검색한다 - `\x01` 단일 바이트는 페이로드에 흔해서 known_id의 정확한
+    # varint 바이트열과 함께 앵커링하지 않으면 오탐 위험이 큼(1값 형태의 `00 08 01`이 겪었던
+    # 것과 같은 종류의 위험, 위 (2)번 주석 참고).
+    if known_id is not None:
+        id_bytes = _encode_varint(known_id)
+        marker_disc = b"\x01" + id_bytes
+        search_start = 0
+        while True:
+            idx = payload.find(marker_disc, search_start)
+            if idx == -1:
+                break
+            if idx > 0:
+                discriminator = payload[idx - 1]
+                pos = idx + len(marker_disc)
+                if discriminator == 0x04:
+                    base_vi = read_varint(payload, pos)
+                    if base_vi.length > 0 and _is_plausible_oath_energy(base_vi.value):
+                        candidates.append((known_id, base_vi.value, 0, base_vi.value))
+                elif discriminator == 0x00:
+                    candidates.append((known_id, 0, 0, 0))
+            search_start = idx + 1
+
     if not candidates:
+        # 2026-07-18 추가: 오드에너지가 완전히 0(기본=0, 추가=0)인 캐릭터의 실제 캡처("살육성
+        # 오드0 실험.pcapng", 게임 UI 확인 0/840)로 확인된 세 번째 케이스 - 기본/추가 둘 다 0이면
+        # 서버가 field_id=1 레코드 자체를 payload에서 통째로 생략한다(2값 마커도 1값 마커도 전혀
+        # 없음). 예전엔 이 경우 후보가 하나도 없으니 그냥 None을 반환해서 "이 스냅샷엔 오드에너지
+        # 정보가 없다"고 정직하게 실패했는데, 그 결과 on_oath_energy 콜백 자체가 안 불려서 이
+        # 캐릭터는 오드에너지 필드가 영원히 갱신되지 않는(GUI에 "-"로 남거나 이전 값이 그대로
+        # 남는) 버그였다(사용자 실측: "인식을 못하는듯"). known_id(이미 확인된 계정 공용
+        # entity_id)가 있으면 그 id로 "명시적 0" 이벤트를 만들어 반환한다 - 필드 생략 = 0이라는
+        # 해석은 이 하나의 실측 사례에만 근거하므로 계속 재검증 필요(특히 "추가는 0인데 기본은
+        # 0이 아닌" 케이스가 별도 마커를 쓰는지 아니면 이것도 똑같이 생략되는지는 아직 미확인).
+        # known_id가 아예 없으면(콜드스타트) 이 id를 어느 캐릭터 것으로 볼지 알 방법이 없으므로
+        # 기존과 동일하게 None을 반환한다(신규 배포 대상 첫 실행 때는 여전히 못 잡음 - 기존
+        # 콜드스타트 제약과 동일선상).
+        if known_id is not None:
+            ev = OathEnergyEvent(known_id, 0, None, payload)
+            ev.is_snapshot = True
+            ev.base = 0
+            ev.dynamic = 0
+            return ev
         return None
 
     chosen = None
@@ -319,6 +402,47 @@ def parse_combat_power_payload(payload: bytes):
     if not (0 < value <= 2_000_000_000):  # 전투력이 20억을 넘을 일은 없다고 보고 넉넉히 잡은 안전판
         return None
     return CombatPowerEvent(value, payload)
+
+
+class ItemLevelEvent:
+    def __init__(self, item_level, raw_packet, arrived_at=None):
+        self.item_level = item_level
+        self.raw_packet = raw_packet
+        self.arrived_at = arrived_at
+
+    def __repr__(self):
+        return f"<ItemLevel {self.item_level}>"
+
+
+def parse_item_level_payload(payload: bytes):
+    """opcode(0x1D,0x56) 템레벨(장비 레벨) 패킷 파싱 (2026-07-19 발견).
+
+    **구조:** payload는 정확히 8바이트, 4바이트 LE 정수 2개로 구성됨 -
+    `[템레벨(4바이트 LE)][템레벨(4바이트 LE), 동일값 중복]`. 사용자가 업로드한
+    "활성성 템레벨 5529 테스트.pcapng"(게임 UI에 표시된 실측값 5529)를 브루트포스로
+    스캔해서 찾음 - combat_power 발견 때와 같은 방법(모든 leaf frame의 모든 바이트
+    offset에서 varint/고정폭 LE 해석을 시도해 알고 있는 참값과 일치하는 지점을 찾음).
+    같은 캡처 안에서 opcode(0x33,0x36)(OwnNickname, "활성성" 캐릭터 정보 큰 패킷으로
+    재사용된 형태)의 페이로드 안에도 offset 28/32에 5529가 연속으로 두 번 나오는 걸
+    확인했지만(자세한 내용은 memory 참고), 이 opcode(0x1D,0x56)는 오직 이 값만 담는
+    작고 전용인 8바이트 페이로드라 훨씬 신뢰도 높은 추출 지점으로 판단해 이걸 채택함
+    (전투력(0x56,0x36)이 자기만의 작은 전용 opcode를 갖는 것과 같은 패턴).
+
+    이 패킷도 combat_power와 마찬가지로 entity_id 필드가 없음 - 항상 "본인" 것으로
+    간주하고, 호출측이 현재 추적 중인 오드에너지 entity_id에 붙여서 저장한다(같은
+    이유로 캐릭터 전환 시 오염 방지 로직도 combat_power와 동일하게 적용 - 자세한 내용은
+    aion2_live_monitor.py의 _on_item_level 참고).
+
+    **주의: 아직 실측 캡처 1건으로만 확인됨 - 두 번째 독립 캡처(다른 템레벨 값)로
+    교차검증 안 됨.** 이 프로젝트의 원칙("단일 캡처 검증은 잠정적으로만 신뢰")에 따라,
+    다른 템레벨 값을 가진 캐릭터의 캡처가 생기면 재검증할 것.
+    """
+    if len(payload) != 8:
+        return None
+    value = struct.unpack_from("<I", payload, 0)[0]
+    if not (0 < value <= 100_000):  # 템레벨이 10만을 넘을 일은 없다고 보고 넉넉히 잡은 안전판
+        return None
+    return ItemLevelEvent(value, payload)
 
 
 class NicknameEvent:
@@ -424,11 +548,12 @@ class StreamProcessor:
     """
 
     def __init__(self, on_oath_energy=None, on_nickname=None, on_unknown=None, get_known_oath_id=None,
-                 on_combat_power=None):
+                 on_combat_power=None, on_item_level=None):
         self.on_oath_energy = on_oath_energy
         self.on_nickname = on_nickname
         self.on_unknown = on_unknown
         self.on_combat_power = on_combat_power  # 2026-07-08 추가: 전투력 갱신 콜백
+        self.on_item_level = on_item_level  # 2026-07-19 추가: 템레벨 갱신 콜백
         # 2026-07-07 추가: 로그인 스냅샷(0x0B,0x61) 파싱 시 "이전에 확인된 진짜 오드에너지 entity_id"를
         # 물어보기 위한 콜백 (parse_own_stats_snapshot_payload 의 known_id 힌트로 전달됨).
         self.get_known_oath_id = get_known_oath_id
@@ -498,6 +623,14 @@ class StreamProcessor:
                 cp_ev.arrived_at = arrived_at
                 if self.on_combat_power:
                     self.on_combat_power(cp_ev)
+            elif self.on_unknown:
+                self.on_unknown((b1, b2), packet, arrived_at)
+        elif (b1, b2) == ITEM_LEVEL_OPCODE:
+            il_ev = parse_item_level_payload(payload)
+            if il_ev is not None:
+                il_ev.arrived_at = arrived_at
+                if self.on_item_level:
+                    self.on_item_level(il_ev)
             elif self.on_unknown:
                 self.on_unknown((b1, b2), packet, arrived_at)
         elif self.on_unknown:
