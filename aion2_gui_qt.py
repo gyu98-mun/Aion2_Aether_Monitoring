@@ -361,6 +361,7 @@ class MainWindow(QWidget):
         # 재사용하고 있던 것과 동일한 패턴. store가 안 주어지면(리플레이/단독 실행 모드)
         # 기존처럼 새로 하나 만든다.
         self.store = store if store is not None else CharacterStore()
+        self._display_save_revision = -1
         self.locked = False
         self._unlocked_opacity = opacity  # 잠금 해제 시 복원할 패널 투명도
 
@@ -458,6 +459,8 @@ class MainWindow(QWidget):
 
         # ---- 기존 run_gui(Tkinter)와 동일한 데이터 흐름 상태 (그대로 이식) ----
         self.row_by_nickname = {}
+        self._displayed_records = {}
+        self._summary_record = {}
         self.entity_nickname = {}
         self.pending_records = {}
 
@@ -551,15 +554,68 @@ class MainWindow(QWidget):
     # ---- 버튼 동작 ----
 
     def _on_refresh(self):
-        # 2026-07-19 수정: store가 이제 공유 인스턴스라 self.store.data는 실시간 캡처 모드에선
-        # 항상 최신이지만(라이브 캡처가 갱신할 때마다 바로 이 인스턴스에 쓰므로), 리플레이/단독
-        # 실행 모드처럼 파일이 외부에서 바뀔 수 있는 경우를 위해 디스크에서 다시 읽어온다.
+        self._sync_display_from_json(manual=True)
+
+    def _sync_after_save(self):
+        # 기존 GUI 이벤트 처리 주기를 사용하되 저장이 없으면 파일을 읽지 않는다.
+        # 여러 저장이 쌓이면 최신 JSON을 한 번 읽어 반영한다.
+        revision = self.store.save_revision
+        if revision != self._display_save_revision:
+            self._display_save_revision = revision
+            self._sync_display_from_json()
+
+    def _sync_display_from_json(self, manual=False):
+        """JSON을 화면의 기준으로 사용한다. 캡처가 쓰는 공유 메모리는 덮어쓰지 않는다."""
         try:
-            self.store.data = self.store._load()
-        except Exception:
-            pass
-        self._load_initial()
-        self.status_label.setText("[알림] 저장된 값 다시 불러옴")
+            with open(self.store.path, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            if not isinstance(data, dict):
+                raise ValueError("캐릭터 목록 형식이 아닙니다")
+            for nickname, record in data.items():
+                if not isinstance(record, dict) or record.get("nickname") != nickname:
+                    raise ValueError("캐릭터 정보 형식이 올바르지 않습니다")
+                if not isinstance(record.get("last_updated") or "", str):
+                    raise ValueError("갱신 시각 형식이 올바르지 않습니다")
+                for field in ("oath_energy", "oath_energy_base", "oath_energy_dynamic",
+                              "combat_power", "item_level", "last_delta"):
+                    value = record.get(field)
+                    if value is not None and type(value) is not int:
+                        raise ValueError("캐릭터 수치 형식이 올바르지 않습니다")
+        except (OSError, ValueError) as exc:
+            self.status_label.setText(f"[JSON 동기화 실패] 기존 화면 유지: {exc}")
+            return False
+
+        records = sorted(data.values(), key=lambda r: r.get("last_updated") or "")
+        records = records[-STATUS_ROW_CAP:]
+        wanted = {record["nickname"] for record in records}
+        changed = False
+        for nickname in list(self.row_by_nickname):
+            if nickname not in wanted:
+                row = self.row_by_nickname.pop(nickname)
+                self.rows_layout.removeWidget(row)
+                row.deleteLater()
+                self._displayed_records.pop(nickname, None)
+                changed = True
+        for record in records:
+            nickname = record["nickname"]
+            if nickname not in self.row_by_nickname or self._displayed_records.get(nickname) != record:
+                # 닉네임이 확정된 JSON이므로 entity_id 기반 캐시를 변경하지 않는다.
+                self._place_row(nickname, record)
+                changed = True
+
+        summary = data.get(self._summary_record.get("nickname"))
+        if summary is None:
+            summary = records[-1] if records else {}
+        if self._summary_record != summary:
+            self._render_summary(summary)
+            if not summary:
+                self._hide_toast()
+            changed = True
+        if changed:
+            self._resize_to_fit()
+        if manual or changed or self.status_label.text().startswith("[JSON 동기화 실패]"):
+            self.status_label.setText("[알림] JSON 기준으로 화면 동기화 완료")
+        return True
 
     def _on_toggle_lock(self):
         self._set_locked(not self.locked)
@@ -666,6 +722,7 @@ class MainWindow(QWidget):
             pass
 
     def _render_summary(self, record):
+        self._summary_record = dict(record)
         total = record.get("oath_energy")
         self.value_label.setText(f"오드에너지 {total}" if total is not None else "대기 중...")
 
@@ -749,6 +806,7 @@ class MainWindow(QWidget):
             self.rows_layout.removeWidget(row)
             self.rows_layout.insertWidget(0, row)  # 방금 갱신된 캐릭터를 맨 위로
         row.update_record(record)
+        self._displayed_records[nickname] = dict(record)
         self._resize_to_fit()
 
     def _resize_to_fit(self):
@@ -861,6 +919,9 @@ class MainWindow(QWidget):
                     self._refresh_all_rows_from_store()
         except queue.Empty:
             pass
+
+
+        self._sync_after_save()
 
 
 def run_gui_qt(event_queue, status_queue, opacity=0.90, store=None):

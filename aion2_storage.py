@@ -100,6 +100,7 @@ class CharacterStore:
         저장 자체(로컬 파일 쓰기)는 절대 실패하면 안 되므로 `_notify`에서 항상 삼킨다."""
         self.path = path
         self.on_change = on_change
+        self.save_revision = 0
         self.data = self._load()
 
     def _notify(self, nickname):
@@ -125,6 +126,8 @@ class CharacterStore:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
         os.replace(tmp_path, self.path)
+        # 성공한 파일 교체만 GUI에 알린다. 업로드 콜백과 독립적으로 삭제도 포함한다.
+        self.save_revision += 1
 
     def _get_or_create(self, nickname):
         if nickname not in self.data:
