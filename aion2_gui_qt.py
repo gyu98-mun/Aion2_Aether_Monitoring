@@ -54,14 +54,16 @@ import os
 import json
 import queue
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
-    QPushButton, QProgressBar, QSystemTrayIcon, QMenu, QMessageBox,
+    QPushButton, QProgressBar, QSystemTrayIcon, QMenu, QMessageBox, QScrollArea,
 )
 
 from aion2_storage import CharacterStore
+from aion2_sanctuary import format_sanctuaries
+from aion2_window_geometry import constrain_resize
 from aion2_live_monitor import (
     _fmt_info_cell, _fmt_date_cell, _fmt_combat_power_cell, STATUS_ROW_CAP,
 )
@@ -113,12 +115,133 @@ def _load_font_scale_index():
     return DEFAULT_FONT_SCALE_INDEX
 
 
-def _save_font_scale_index(idx):
+def _save_gui_settings(**changes):
     try:
+        try:
+            with open(GUI_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data.update(changes)
         with open(GUI_SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"font_scale_index": idx}, f)
+            json.dump(data, f)
     except Exception:
         pass  # 저장 실패(권한 등)해도 기능 자체는 계속 동작 - 다음 실행 때 기본값으로 시작할 뿐
+
+
+def _save_font_scale_index(idx):
+    _save_gui_settings(font_scale_index=idx)
+
+
+class RowScrollArea(QScrollArea):
+    """휠 한 칸을 정확히 캐릭터 한 행으로 변환한다."""
+    def __init__(self):
+        super().__init__()
+        self.row_step = 71
+        self._wheel_remainder = 0
+        self.verticalScrollBar().installEventFilter(self)
+        self.verticalScrollBar().sliderReleased.connect(self.snap_position)
+
+    def snap_position(self):
+        bar = self.verticalScrollBar()
+        bar.setValue(round(bar.value() / self.row_step) * self.row_step)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if not delta and event.pixelDelta().y():
+            delta = event.pixelDelta().y() * 120 / self.row_step
+        self._wheel_remainder += delta
+        steps = int(self._wheel_remainder / 120)
+        self._wheel_remainder -= steps * 120
+        if steps:
+            bar = self.verticalScrollBar()
+            bar.setValue(round(bar.value() / self.row_step) * self.row_step - steps * self.row_step)
+        event.accept()
+
+    def eventFilter(self, watched, event):
+        if watched is self.verticalScrollBar() and event.type() == QEvent.Wheel:
+            self.wheelEvent(event)
+            return True
+        return super().eventFilter(watched, event)
+
+
+class ResizeHandle(QWidget):
+    """OS 프레임에 의존하지 않는 8방향 드래그 영역."""
+    def __init__(self, window, edge):
+        super().__init__(window)
+        self.edge = edge
+        self.drag_origin = None
+        self.setStyleSheet("background-color: rgba(90, 100, 120, 18);")
+        self.setCursor({1: Qt.SizeHorCursor, 2: Qt.SizeHorCursor,
+                        3: Qt.SizeVerCursor, 6: Qt.SizeVerCursor,
+                        4: Qt.SizeFDiagCursor, 8: Qt.SizeFDiagCursor,
+                        5: Qt.SizeBDiagCursor, 7: Qt.SizeBDiagCursor}[edge])
+        self.setMouseTracking(True)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.edge != 8:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#C2D4E5" if self.underMouse() else "#91A5BA"))
+        # 오른쪽 아래 삼각형 점 무늬. 별도의 QSizeGrip은 만들지 않는다.
+        for column, row in ((0, 2), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)):
+            painter.drawEllipse(self.width() - 10 + column * 3,
+                                self.height() - 10 + row * 3, 2, 2)
+
+    def enterEvent(self, event):
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or self.window().locked:
+            return
+        window = self.window()
+        window._snap_height_to_rows()
+        window._native_resizing = True
+        window._row_snap_timer.stop()
+        self.drag_origin = event.globalPosition().toPoint()
+        self.original_geometry = window.geometry()
+        self.grabMouse()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_origin is None:
+            return
+        window = self.window()
+        delta = event.globalPosition().toPoint() - self.drag_origin
+        original = self.original_geometry
+        left, top = original.x(), original.y()
+        right, bottom = left + original.width(), top + original.height()
+        if self.edge in (1, 4, 7): left += delta.x()
+        if self.edge in (2, 5, 8): right += delta.x()
+        if self.edge in (3, 4, 5): top += delta.y()
+        if self.edge in (6, 7, 8): bottom += delta.y()
+        overhead, row_height, spacing, count = window._row_resize_metrics
+        left, top, right, bottom = constrain_resize(
+            (left, top, right, bottom), self.edge, ratio=1,
+            minimum_width=window.minimumWidth(), minimum_height=window.minimumHeight(),
+            maximum_height=window.maximumHeight(), overhead=overhead,
+            row_height=row_height, spacing=spacing, count=count)
+        window.setGeometry(left, top, right-left, bottom-top)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if self.drag_origin is not None and event.button() == Qt.LeftButton:
+            self.releaseMouse()
+            self.drag_origin = None
+            window = self.window()
+            window._native_resizing = False
+            window._snap_height_to_rows()
+            event.accept()
 
 
 class CharacterRow(QFrame):
@@ -131,12 +254,15 @@ class CharacterRow(QFrame):
     # 숫자 폰트를 다시 13px로 키우면서 행 높이도 40px로 살짝 늘림(잘림 방지).
     # 2026-08-08: 아래 값은 글자 크기 배율 1.0(보통) 기준 기본값으로 의미가 바뀌었다 -
     # 실제 적용 크기는 _px()를 거쳐 self.scale이 곱해진다.
-    ROW_HEIGHT_BASE = 40
+    ROW_HEIGHT_BASE = 68
 
     def __init__(self, nickname, on_delete=None, scale=1.0):
         super().__init__()
         self.nickname = nickname
         self._on_delete = on_delete
+        self._on_select = None
+        self._selected = None
+        self.setCursor(Qt.PointingHandCursor)
         self.scale = scale
         self.setObjectName("row")
         color = _color_for_nickname(nickname)
@@ -147,7 +273,11 @@ class CharacterRow(QFrame):
             f"border-left: 3px solid {color}; }}"
         )
 
-        outer = QHBoxLayout(self)
+        container = QVBoxLayout(self)
+        container.setContentsMargins(0, 0, 0, 0)
+        container.setSpacing(0)
+        outer = QHBoxLayout()
+        container.addLayout(outer)
         outer.setContentsMargins(8, 3, 6, 3)
         outer.setSpacing(6)
 
@@ -199,8 +329,30 @@ class CharacterRow(QFrame):
         self.delete_btn.setToolTip("이 캐릭터 목록에서 삭제")
         self.delete_btn.clicked.connect(self._handle_delete_clicked)
         outer.addWidget(self.delete_btn)
+        self.sanctuary_label = QLabel(format_sanctuaries(None))
+        self.sanctuary_label.setContentsMargins(8, 0, 6, 3)
+        container.addWidget(self.sanctuary_label)
 
         self._apply_scale_styles()
+
+    def set_selected(self, selected):
+        if self._selected == selected:
+            return
+        self._selected = selected
+        color = _color_for_nickname(self.nickname)
+        background = "rgba(45,75,100,235)" if selected else "rgba(26,26,34,210)"
+        border = "#8ACFFF" if selected else "transparent"
+        self.setStyleSheet(
+            f"#row {{ background-color: {background}; border-radius: 6px; "
+            f"border: 1px solid {border}; border-left: 3px solid {color}; }}"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._on_select is not None:
+            self._on_select(self.nickname)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def _px(self, base_px):
         return max(1, round(base_px * self.scale))
@@ -210,8 +362,9 @@ class CharacterRow(QFrame):
         적용 로직 (2026-08-08 추가) - 위젯을 새로 만들지 않고 이미 있는 위젯의 스타일만
         다시 계산해서 입힌다."""
         self.setFixedHeight(self._px(self.ROW_HEIGHT_BASE))
+        self.sanctuary_label.setStyleSheet(f"color: #B8D8EA; font-size: {self._px(12)}px;")
         self.name_label.setStyleSheet(
-            f"color: #EEEEEE; font-weight: bold; font-size: {self._px(11)}px;"
+            f"color: #EEEEEE; font-weight: bold; font-size: {self._px(13)}px;"
         )
         # 2026-07-18 수정: 사용자 요청 - "오드랑 전투력 숫자들 크기를 좀 키워도될듯한데".
         # 10px -> 13px(기준값) + 굵게. 기본/추가 색상은 각각 개별 지정.
@@ -239,6 +392,9 @@ class CharacterRow(QFrame):
             self._on_delete(self.nickname)
 
     def update_record(self, record):
+        self.sanctuary_label.setText(format_sanctuaries(record.get("sanctuary_counts")))
+        updated = record.get("sanctuary_updated") or "미수신"
+        self.sanctuary_label.setToolTip(f"성역 스냅샷 갱신: {updated}\n루드라 ID는 잠정 매핑. 입장 후에는 다음 스냅샷 수신 시 갱신됩니다.")
         base = record.get("oath_energy_base")
         self.base_label.setText(_fmt_info_cell(base))
         self.extra_label.setText(_fmt_info_cell(record.get("oath_energy_dynamic")))
@@ -379,11 +535,12 @@ class MainWindow(QWidget):
         # 2026-07-19 수정: 템레벨 칸이 추가되면서 320px는 너무 좁아짐(날짜 칸과 겹침) - 370으로 확장.
         # 2026-07-19 재수정: 삭제(✕) 버튼 칸이 추가되면서 다시 좁아짐 - 388로 확장.
         # 2026-08-08 수정: 저장된 글자 크기 배율에 맞춰 시작 너비도 같이 스케일.
-        self.resize(self._px(self.BASE_WIDTH), 340)
+        self.resize(self._px(self.BASE_WIDTH), 540)
+        self.setMinimumHeight(240)
         self.setMinimumWidth(self._px(self.BASE_MIN_WIDTH))
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setContentsMargins(5, 5, 5, 5)
 
         self.card = QFrame()
         self.card.setObjectName("card")
@@ -401,7 +558,15 @@ class MainWindow(QWidget):
         summary.setContentsMargins(10, 4, 10, 4)
         summary.setSpacing(1)
         self.value_label = QLabel("대기 중...")
-        summary.addWidget(self.value_label)
+        summary_top = QHBoxLayout()
+        summary_top.addWidget(self.value_label, 1)
+        self.selected_nickname = None
+        self.selected_label = QLabel("행을 클릭해 선택")
+        self.selected_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.selected_label.setWordWrap(True)
+        self.selected_label.setTextFormat(Qt.PlainText)
+        summary_top.addWidget(self.selected_label, 1)
+        summary.addLayout(summary_top)
 
         self.delta_label = QLabel("아이템을 사용하거나 캐릭터로 접속하면 표시됩니다")
         self.delta_label.setWordWrap(True)
@@ -421,18 +586,49 @@ class MainWindow(QWidget):
         self.section_label.setContentsMargins(10, 2, 10, 2)
         card_layout.addWidget(self.section_label)
 
-        # 2026-07-18 재수정: 사용자 요청 - "캐릭터 현황쪽에 스크롤을 하지않도록 공간이
-        # 부족하면 자동으로 들어가서 모두 한번에 보이도록 하고싶어". QScrollArea를 없애고
-        # rows_container를 카드에 직접 넣는다 - 스트레치를 안 주면 이 위젯의 높이는
-        # 정확히 "행 개수 × 행 높이"만큼만 차지하고, 창 자체를 그 높이에 맞춰 매번
-        # 다시 리사이즈한다(_resize_to_fit, _place_row 끝에서 호출) - 그래서 캐릭터가
-        # 늘어나면 창이 커지고 줄어들면 창이 작아지지, 안에서 스크롤이 생기지 않는다.
+        # 현황 목록만 스크롤하고 상단/하단은 고정한다.
         self.rows_container = QWidget()
         self.rows_container.setStyleSheet("background: transparent;")
         self.rows_layout = QVBoxLayout(self.rows_container)
         self.rows_layout.setContentsMargins(10, 0, 10, 4)
         self.rows_layout.setSpacing(3)
-        card_layout.addWidget(self.rows_container)
+        self.rows_layout.setAlignment(Qt.AlignTop)
+        self.scroll_area = RowScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setWidget(self.rows_container)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea { background: transparent; }
+            QScrollBar:vertical {
+                background: #222630;
+                width: 10px;
+                margin: 5px 1px 5px 1px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #91A5BA;
+                min-height: 32px;
+                border: 1px solid #A5B8CA;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #BCD4E8;
+                border-color: #D2E5F4;
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: #70C9F3;
+                border-color: #A0DEFA;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+                border: none;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+        """)
+        card_layout.addWidget(self.scroll_area, 1)
 
         # 2026-07-18 수정: 사용자 요청 - "기본 700 + 추가 45 = 745" 줄(예전 breakdown_label)이
         # 상단에 항상 떠 있는 게 "사실 이부분도 필요없긴한데", 대신 "기본 + 추가는 밑에
@@ -484,6 +680,23 @@ class MainWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._poll_queue)
         self.timer.start(150)
+        self._size_save_timer = QTimer(self)
+        self._size_save_timer.setSingleShot(True)
+        self._size_save_timer.timeout.connect(lambda: _save_gui_settings(window_width=self.width(), window_height=self.height()))
+        try:
+            with open(GUI_SETTINGS_PATH, "r", encoding="utf-8") as stream:
+                settings = json.load(stream)
+            screen = self.screen().availableGeometry()
+            self.resize(min(screen.width(), max(self.minimumWidth(), int(settings.get("window_width", self.width())))),
+                        min(screen.height(), max(self.minimumHeight(), int(settings.get("window_height", self.height())))))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        self._row_snap_timer = QTimer(self)
+        self._row_snap_timer.setSingleShot(True)
+        self._row_snap_timer.timeout.connect(self._snap_height_to_rows)
+        self._row_snap_timer.start(0)
+        self._resize_handles = [ResizeHandle(self, edge) for edge in range(1, 9)]
+        self._position_resize_handles()
 
     def _px(self, base_px):
         return max(1, round(base_px * self.font_scale))
@@ -627,6 +840,8 @@ class MainWindow(QWidget):
         클릭이 막히고 배경이 완전 투명이 되는거야". 해제는 창 자체가 클릭을 안 받으므로
         타이틀바 버튼이 아니라 트레이 아이콘 메뉴(_create_tray_icon)에서만 가능하다."""
         self.locked = locked
+        for handle in getattr(self, "_resize_handles", []):
+            handle.setVisible(not locked)
         self.title_bar.lock_btn.setText("🔒" if locked else "🔓")
         self.setAttribute(Qt.WA_TransparentForMouseEvents, locked)
         if locked:
@@ -697,8 +912,16 @@ class MainWindow(QWidget):
         self.activateWindow()
 
     def _quit(self):
+        self.close()
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        self._size_save_timer.stop()
+        self._row_snap_timer.stop()
+        self._toast_timer.stop()
         if self.tray_icon is not None:
             self.tray_icon.hide()
+        event.accept()
         QApplication.instance().quit()
 
     # ---- 데이터 반영 (기존 run_gui의 render_summary/upsert_status_row/poll_queue 이식) ----
@@ -724,7 +947,8 @@ class MainWindow(QWidget):
     def _render_summary(self, record):
         self._summary_record = dict(record)
         total = record.get("oath_energy")
-        self.value_label.setText(f"오드에너지 {total}" if total is not None else "대기 중...")
+        nickname = record.get("nickname") or "캐릭터 확인 중"
+        self.value_label.setText(f"{nickname} / {total}" if total is not None else "대기 중...")
 
         # 2026-07-19 추가: 사용자 요청 - "템렙이 로고에도 찍히게 해줘". _poll_queue가 오드에너지/
         # 전투력/템레벨 이벤트 전부에 대해 _render_summary를 부르므로(레코드가 있는 모든 이벤트),
@@ -758,36 +982,30 @@ class MainWindow(QWidget):
         self._toast_timer.start(duration_ms)  # 이미 타이머가 돌고 있었으면 자동으로 재시작됨
 
     def _hide_toast(self):
+        if getattr(self, "_native_resizing", False):
+            self._toast_timer.start(150)
+            return
         self.toast_label.setVisible(False)
         self._resize_to_fit()
 
     def _upsert_row(self, record, nickname_confirmed=False):
+        # 공통 항목 ID는 캐릭터 식별자가 아니다. 이름 확인/보류 병합은
+        # monitor가 담당하며, 화면은 레코드에 명시된 닉네임만 사용한다.
+        nickname = record.get("nickname")
+        if not nickname:
+            return
         entity_id = record.get("entity_id")
-        if entity_id is None:
-            return
-
-        if nickname_confirmed:
-            nickname = record.get("nickname")
-            if not nickname:
-                return
+        if entity_id is not None:
             self.entity_nickname[entity_id] = nickname
-            pending = self.pending_records.pop(entity_id, None)
-            merged = {**pending, **record} if pending else record
-            self._place_row(nickname, merged)
-            return
-
-        known_nick = self.entity_nickname.get(entity_id)
-        row = self.row_by_nickname.get(known_nick) if known_nick else None
-        if known_nick is None or row is None:
-            self.pending_records[entity_id] = record
-            return
-        self._place_row(known_nick, record)
+            self.pending_records.pop(entity_id, None)
+        self._place_row(nickname, record)
 
     def _place_row(self, nickname, record):
         row = self.row_by_nickname.get(nickname)
         if row is None:
             # 2026-08-08 수정: 새로 만드는 행도 지금 설정된 글자 크기를 바로 받도록 scale 전달.
             row = CharacterRow(nickname, on_delete=self._on_delete_row, scale=self.font_scale)
+            row._on_select = self._select_character
             self.row_by_nickname[nickname] = row
             self.rows_layout.insertWidget(0, row)
             # STATUS_ROW_CAP 초과분은 가장 오래된(맨 아래) 것부터 제거한다. 스크롤
@@ -810,26 +1028,103 @@ class MainWindow(QWidget):
         self._resize_to_fit()
 
     def _resize_to_fit(self):
-        """스크롤 없이 모든 캐릭터 행이 한 번에 보이도록, 매번 행이 추가/제거될 때마다
-        창 높이를 실제 필요한 높이에 딱 맞춰 다시 잡는다 (너비는 고정 유지). rows_container에
-        스트레치를 안 줬기 때문에 outer 레이아웃의 sizeHint().height()가 곧 "행 개수만큼만
-        정확히 차지한" 이상적인 높이가 된다."""
-        # Qt는 보통 중첩된 위젯의 sizeHint 재계산을 이벤트 루프로 넘어가는 LayoutRequest
-        # 이벤트로 처리한다 - activate()를 직접 호출해서 이벤트 루프를 기다리지 않고 그
-        # 자리에서 바로 최신 sizeHint를 얻는다 (안 그러면 연속으로 행이 여러 개 추가될 때
-        # 한 틱 뒤처진 크기로 리사이즈되는 경우가 있었음, 헤드리스 테스트로 확인).
-        # 2026-07-18 추가: 토스트(_show_toast/_hide_toast)처럼 위젯을 숨기기만 하고 크기가
-        # 줄어드는 경우, activate()만으로는 캐시된(줄어들기 전) sizeHint를 그대로 돌려주는
-        # 경우가 있었다(오프스크린 렌더링으로 재현/확인) - invalidate()로 캐시를 먼저
-        # 버려야 activate() 직후에도 정확한 최신 sizeHint를 얻을 수 있다.
+        self._refresh_selection()
         self.rows_layout.invalidate()
-        self.card_layout.invalidate()
-        self.layout().invalidate()
-        self.rows_layout.activate()
-        self.card_layout.activate()
-        self.layout().activate()
-        target_height = self.layout().sizeHint().height()
-        self.resize(self.width(), target_height)
+        self.rows_container.updateGeometry()
+        if hasattr(self, "_row_snap_timer"):
+            self._row_snap_timer.start(0)
+
+    def _select_character(self, nickname):
+        self.selected_nickname = None if self.selected_nickname == nickname else nickname
+        self._refresh_selection()
+
+    def _refresh_selection(self):
+        if self.selected_nickname not in self.row_by_nickname:
+            self.selected_nickname = None
+        for nickname, row in self.row_by_nickname.items():
+            row.set_selected(nickname == self.selected_nickname)
+        record = self._displayed_records.get(self.selected_nickname, {})
+        base, extra = record.get("oath_energy_base"), record.get("oath_energy_dynamic")
+        total = base + extra if base is not None and extra is not None else record.get("oath_energy")
+        self.selected_label.setStyleSheet(
+            f"color: #9ED8FF; font-size: {self._px(12)}px; font-weight: bold;"
+        )
+        self.selected_label.setText(
+            f"선택: {self.selected_nickname}\n총 오드 {_fmt_info_cell(total)}"
+            if self.selected_nickname else "행을 클릭해 선택"
+        )
+
+    def _snap_height_to_rows(self):
+        if getattr(self, "_snapping_rows", False) or getattr(self, "_native_resizing", False):
+            return
+        self._snapping_rows = True
+        try:
+            self.layout().activate()
+            self.card_layout.activate()
+            # 카드의 실제 최소 폭에 목록 여백과 스크롤바 폭을 별도로 확보한다.
+            # 스크롤바가 생기고 사라질 때 최소 폭이 흔들리지 않도록 항상 예약한다.
+            row_width = max((row.minimumSizeHint().width()
+                             for row in self.row_by_nickname.values()), default=0)
+            margins = self.rows_layout.contentsMargins()
+            scrollbar_width = self.scroll_area.verticalScrollBar().sizeHint().width()
+            outer_width = max(0, self.width() - self.scroll_area.width())
+            minimum_width = max(self._px(self.BASE_MIN_WIDTH),
+                                row_width + margins.left() + margins.right()
+                                + scrollbar_width + outer_width + 4)
+            self.setMinimumWidth(minimum_width)
+            count = len(self.row_by_nickname)
+            row_height = self._px(CharacterRow.ROW_HEIGHT_BASE)
+            spacing = self.rows_layout.spacing()
+            step = row_height + spacing
+            margins = self.rows_layout.contentsMargins()
+            overhead = self.height() - self.scroll_area.viewport().height() + margins.top() + margins.bottom()
+            self._row_resize_metrics = (overhead, row_height, spacing, count)
+            if count:
+                screen_height = self.screen().availableGeometry().height()
+                capacity = max(1, (screen_height - overhead + spacing) // step)
+                maximum_rows = min(count, capacity)
+                visible = max(1, min(maximum_rows, int((self.height() - overhead + spacing) / step + 0.5)))
+                minimum = overhead + row_height
+                maximum = overhead + maximum_rows * step - spacing
+                target = overhead + visible * step - spacing
+            else:
+                minimum = maximum = target = overhead + 40
+            self.setMinimumHeight(minimum)
+            self.setMaximumHeight(maximum)
+            self.resize(self.width(), target)
+            bar = self.scroll_area.verticalScrollBar()
+            self.scroll_area.row_step = step
+            bar.setSingleStep(step)
+            bar.setPageStep(max(1, self.scroll_area.viewport().height() // step) * step)
+            bar.setValue(round(bar.value() / step) * step)
+        finally:
+            self._snapping_rows = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_resize_handles"):
+            self._position_resize_handles()
+        if hasattr(self, "_size_save_timer"):
+            self._size_save_timer.start(400)
+        if (hasattr(self, "_row_snap_timer") and not getattr(self, "_snapping_rows", False)
+                and not getattr(self, "_native_resizing", False)):
+            self._row_snap_timer.start(80)
+
+    def _position_resize_handles(self):
+        width, height = self.width(), self.height()
+        border, corner = 5, 10
+        boxes = {1: (0, corner, border, height-2*corner),
+                 2: (width-border, corner, border, height-2*corner),
+                 3: (corner, 0, width-2*corner, border),
+                 6: (corner, height-border, width-2*corner, border),
+                 4: (0, 0, corner, corner),
+                 5: (width-corner, 0, corner, corner),
+                 7: (0, height-corner, corner, corner),
+                 # 표식과 실제 클릭 영역을 어두운 카드 안쪽으로 이동한다.
+                 8: (width-22, height-22, 16, 16)}
+        for handle in self._resize_handles:
+            handle.setGeometry(*boxes[handle.edge])
+            handle.raise_()
 
     def _on_delete_row(self, nickname):
         """캐릭터 행의 ✕ 버튼 클릭 처리 (2026-07-19 추가, 사용자 요청: "안보고싶은캐릭터
@@ -881,6 +1176,10 @@ class MainWindow(QWidget):
             self._upsert_row(record, nickname_confirmed=True)
 
     def _poll_queue(self):
+        # 드래그 중에는 카드/상태 라벨 갱신으로 크기 계산 기준이 변하지 않게 한다.
+        # 큐는 보존되며 드래그가 끝나면 기존 주기로 처리된다.
+        if getattr(self, "_native_resizing", False):
+            return
         try:
             while True:
                 ev = self.event_queue.get_nowait()
@@ -903,7 +1202,7 @@ class MainWindow(QWidget):
                         f"닉네임확인={'예' if nickname_confirmed else '아니오'}"
                     )
                 else:
-                    self.value_label.setText(f"오드에너지 {ev.new_total}")
+                    self.value_label.setText(f"캐릭터 확인 중 / {ev.new_total}")
                     print(f"[오드에너지] 총량={ev.new_total} (레코드 스냅샷 없음)")
         except queue.Empty:
             pass

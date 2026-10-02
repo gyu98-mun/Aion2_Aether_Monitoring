@@ -19,6 +19,7 @@ AION2 오드에너지 실시간 파서 - 핵심 로직 (네트워크 캡처와 �
 
 import struct
 import lz4.block
+from aion2_sanctuary import parse_sanctuary_snapshot
 
 OATH_ENERGY_OPCODE = (0x0C, 0x61)
 OWN_NICKNAME_OPCODE = (0x33, 0x36)  # 참고: TK-open-public/Aion2-Dps-Meter PropertyHandler.kt searchOwnNickname
@@ -612,6 +613,7 @@ class StreamProcessor:
             known_id = self.get_known_oath_id() if self.get_known_oath_id else None
             snap_ev = parse_own_stats_snapshot_payload(payload, known_id=known_id)
             if snap_ev is not None:
+                snap_ev.sanctuary_counts = parse_sanctuary_snapshot(payload)
                 snap_ev.arrived_at = arrived_at
                 if self.on_oath_energy:
                     self.on_oath_energy(snap_ev)

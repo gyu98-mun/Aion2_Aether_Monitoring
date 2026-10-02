@@ -63,19 +63,14 @@ import threading
 import time
 import types
 
+from aion2_logging import setup_file_logging
+
+if getattr(sys, "frozen", False):
+    setup_file_logging()
+
 from aion2_core import StreamProcessor, StreamAssembler, LiveTcpReassembler
 from aion2_storage import CharacterStore
 import aion2_uploader  # 2026-08-13 추가, 2단계 서버 업로드 - server_config.json 없으면 전부 no-op
-
-# exe로 묶을 때(--noconsole/--windowed) 콘솔이 없으면 sys.stdout/stderr 가 None이 되어
-# print() 호출이 그대로 죽는다 (AttributeError: 'NoneType' object has no attribute 'write').
-# 콘솔 유무와 상관없이 항상 안전하게 동작하도록 더미 스트림으로 대체한다.
-if getattr(sys, "frozen", False) and (sys.stdout is None or sys.stderr is None):
-    import io
-    if sys.stdout is None:
-        sys.stdout = io.StringIO()
-    if sys.stderr is None:
-        sys.stderr = io.StringIO()
 
 DEFAULT_SERVER_NET = "206.127.156.0/24"
 DEFAULT_PORT = 13328
@@ -452,6 +447,8 @@ class LiveCapture:
                 "last_delta": ev.delta,
                 "last_updated": datetime.datetime.now().isoformat(timespec="seconds"),
             })
+            if getattr(ev, "sanctuary_counts", None) is not None:
+                pending["sanctuary_counts"] = ev.sanctuary_counts
             ev.display_name = f"캐릭터(id={ev.entity_id})"
             ev.record = {"entity_id": ev.entity_id, "nickname": None, **pending}
 
@@ -518,6 +515,8 @@ class LiveCapture:
                     self.store.update_item_level(
                         ev.nickname, pending["item_level"], entity_id=self.known_oath_id,
                     )
+            if pending and pending.get("sanctuary_counts") is not None:
+                self.store.update_sanctuaries(ev.nickname, pending["sanctuary_counts"])
             record_snapshot = dict(self.store.data.get(ev.nickname, {}))
             self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
 
@@ -596,7 +595,9 @@ class LiveCapture:
                                    "combat_power_updated": cp_updated}
                 self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
-            threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid).start()
+            timer = threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid)
+            timer.daemon = True
+            timer.start()
         else:
             record_snapshot = {"entity_id": self.known_oath_id, "nickname": None, **pending}
             self.event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
@@ -685,19 +686,26 @@ class LiveCapture:
         self.live_reassembler.feed(seq, payload, time.time())
 
     def start(self):
-        from scapy.sendrecv import sniff
+        from scapy.sendrecv import AsyncSniffer
 
         bpf = f"tcp and net {self.server_net} and port {self.port}"
 
         def run():
             try:
-                sniff(
-                    filter=bpf,
-                    prn=self._packet_callback,
-                    store=False,
-                    iface=self.iface,
-                    stop_filter=lambda p: self._stop.is_set(),
+                ready = threading.Event()
+                sniffer = AsyncSniffer(
+                    filter=bpf, prn=self._packet_callback, store=False,
+                    iface=self.iface, started_callback=ready.set,
                 )
+                sniffer.start()
+                # stop_cb가 준비되기 전 stop()을 호출하지 않는다.
+                while not ready.wait(0.05):
+                    if not sniffer.thread.is_alive():
+                        sniffer.join()
+                        return
+                self._stop.wait()
+                if sniffer.running:
+                    sniffer.stop()
             except Exception as e:
                 self.status_queue.put(
                     f"[에러] 캡처 스레드 종료됨: {e!r}  "
@@ -709,7 +717,8 @@ class LiveCapture:
 
         # 몇 초 지나도 매칭 패킷이 하나도 없으면 안내 메시지
         def watchdog():
-            time.sleep(6)
+            if self._stop.wait(6):
+                return
             if not self.first_packet_seen:
                 self.status_queue.put(
                     f"[안내] 6초간 {self.server_net}:{self.port} 트래픽이 전혀 안 잡힘. "
@@ -720,6 +729,12 @@ class LiveCapture:
 
     def stop(self):
         self._stop.set()
+        timer = getattr(self, "_regen_timer", None)
+        if timer is not None:
+            timer.cancel()
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
 
 
 def _npcap_installed():
@@ -919,6 +934,8 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 "last_delta": ev.delta,
                 "last_updated": datetime.datetime.now().isoformat(timespec="seconds"),
             })
+            if getattr(ev, "sanctuary_counts", None) is not None:
+                pending["sanctuary_counts"] = ev.sanctuary_counts
             ev.display_name = f"캐릭터(id={ev.entity_id})"
             ev.record = {"entity_id": ev.entity_id, "nickname": None, **pending}
 
@@ -949,6 +966,8 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 # 2026-07-19 추가: 템레벨도 닉네임 확인 시점에 같이 플러시.
                 if pending.get("item_level") is not None:
                     store.update_item_level(ev.nickname, pending["item_level"], entity_id=known["id"])
+            if pending and pending.get("sanctuary_counts") is not None:
+                store.update_sanctuaries(ev.nickname, pending["sanctuary_counts"])
             record_snapshot = dict(store.data.get(ev.nickname, {}))
             event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=True))
 
@@ -998,7 +1017,9 @@ def replay_pcap(path, server_net, port, event_queue, status_queue, speed=0.0):
                 }
                 event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
 
-            threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid).start()
+            timer = threading.Timer(COMBAT_POWER_DISPLAY_DEBOUNCE, _emit_if_still_valid)
+            timer.daemon = True
+            timer.start()
         else:
             record_snapshot = {"entity_id": known["id"], "nickname": None, **pending}
             event_queue.put(types.SimpleNamespace(record=record_snapshot, nickname_confirmed=False))
@@ -1410,7 +1431,7 @@ def _next_periodic_regen_time(now=None):
     return min(candidates)
 
 
-def _schedule_periodic_regen(store, status_queue):
+def _schedule_periodic_regen(store, status_queue, capture):
     """프로그램이 켜져 있는 동안 정기 충전 시각마다 저장된 모든 캐릭터의 왼쪽 숫자(기본
     오드)를 실제 패킷 없이 자동으로 +15 해준다 (사용자 요청, 2026-07-09) - "우리 프로그램이
     돌고있는동안 2시 5시 8시 11시 오전 오후로 15씩 증가하는 로직은 추가할수 있지 않아?".
@@ -1436,6 +1457,8 @@ def _schedule_periodic_regen(store, status_queue):
     꺼져있던 동안의 공백을 즉시 메운다.
     """
     def _fire():
+        if capture._stop.is_set():
+            return
         try:
             store.catch_up_periodic_regen(PERIODIC_REGEN_AMOUNT, PERIODIC_REGEN_HOURS)
             status_queue.put(
@@ -1444,11 +1467,18 @@ def _schedule_periodic_regen(store, status_queue):
             )
         except Exception as e:
             status_queue.put(f"[정기충전][에러] 적용 실패: {e!r}")
-        _schedule_periodic_regen(store, status_queue)  # 다음 시각으로 재예약
+        _schedule_periodic_regen(store, status_queue, capture)
 
+    if capture._stop.is_set():
+        return
     next_time = _next_periodic_regen_time()
     delay = max((next_time - datetime.datetime.now()).total_seconds(), 1.0)
-    threading.Timer(delay, _fire).start()
+    timer = threading.Timer(delay, _fire)
+    timer.daemon = True
+    capture._regen_timer = timer
+    timer.start()
+    if capture._stop.is_set():
+        timer.cancel()
 
 
 def _start_periodic_regen(capture, status_queue):
@@ -1474,7 +1504,7 @@ def _start_periodic_regen(capture, status_queue):
         status_queue.put("[정기충전] 시작 시 경과분 소급 반영 완료")
     except Exception as e:
         status_queue.put(f"[정기충전][에러] 시작 시 소급 반영 실패: {e!r}")
-    _schedule_periodic_regen(capture.store, status_queue)
+    _schedule_periodic_regen(capture.store, status_queue, capture)
 
 
 def main():
@@ -1501,6 +1531,7 @@ def main():
     event_queue = queue.Queue()
     status_queue = queue.Queue()
 
+    capture = None
     if args.replay:
         t = threading.Thread(
             target=replay_pcap,
@@ -1533,31 +1564,35 @@ def main():
         # 않으므로, 정기충전이 known_base를 올려도 같은 회귀가 재발하지 않을 것으로 판단됨.
         _start_periodic_regen(capture, status_queue)
 
-    if args.no_gui:
-        run_console(event_queue, status_queue)
-    else:
-        # 2026-07-18 추가: PySide6(Qt) 기반 새 GUI(aion2_gui_qt.py)를 먼저 시도한다 -
-        # 사용자가 참고 이미지를 보여주며 "전체 디자인까지 이 느낌으로 재단장"을 요청,
-        # PySide6로 전체 재작성하기로 확정함(AskUserQuestion). 여기서 지연 임포트하는 이유:
-        # aion2_gui_qt.py가 모듈 최상단에서 이 파일(aion2_live_monitor)의 포맷터 함수/
-        # STATUS_ROW_CAP을 가져다 쓰는데, main() 안에서 임포트하면 그 시점엔 이 파일이
-        # 이미 다 로드된 뒤라 순환 참조가 안 생긴다. PySide6 미설치거나 실행 중 에러가 나면
-        # 기존 Tkinter GUI(run_gui)로, 그것도 실패하면 콘솔 모드로 2단계 폴백한다.
-        try:
-            from aion2_gui_qt import run_gui_qt
-            # 2026-07-19 수정: 삭제 버튼 기능을 위해 GUI가 자기만의 CharacterStore를 새로
-            # 만들지 않고 LiveCapture가 이미 갖고 있는 capture.store를 그대로 공유하게 함 -
-            # 주기적 오드 재생 스케줄러(_schedule_periodic_regen)가 같은 이유로 capture.store를
-            # 재사용하는 것과 동일한 패턴. 두 인스턴스가 따로 놀면 삭제해도 LiveCapture 쪽의
-            # 옛 메모리 상태가 다음 저장 때 되살려버리는 문제가 생긴다.
-            run_gui_qt(event_queue, status_queue, opacity=args.opacity, store=capture.store)
-        except Exception as e:
-            print(f"PySide6 GUI 실행 실패 ({e}), 기존 Tkinter GUI로 전환합니다.")
+    try:
+        if args.no_gui:
+            run_console(event_queue, status_queue)
+        else:
+            # 2026-07-18 추가: PySide6(Qt) 기반 새 GUI(aion2_gui_qt.py)를 먼저 시도한다 -
+            # 사용자가 참고 이미지를 보여주며 "전체 디자인까지 이 느낌으로 재단장"을 요청,
+            # PySide6로 전체 재작성하기로 확정함(AskUserQuestion). 여기서 지연 임포트하는 이유:
+            # aion2_gui_qt.py가 모듈 최상단에서 이 파일(aion2_live_monitor)의 포맷터 함수/
+            # STATUS_ROW_CAP을 가져다 쓰는데, main() 안에서 임포트하면 그 시점엔 이 파일이
+            # 이미 다 로드된 뒤라 순환 참조가 안 생긴다. PySide6 미설치거나 실행 중 에러가 나면
+            # 기존 Tkinter GUI(run_gui)로, 그것도 실패하면 콘솔 모드로 2단계 폴백한다.
             try:
-                run_gui(event_queue, status_queue, opacity=args.opacity)
-            except Exception as e2:
-                print(f"GUI 실행 실패 ({e2}), 콘솔 모드로 전환합니다.")
-                run_console(event_queue, status_queue)
+                from aion2_gui_qt import run_gui_qt
+                # 2026-07-19 수정: 삭제 버튼 기능을 위해 GUI가 자기만의 CharacterStore를 새로
+                # 만들지 않고 LiveCapture가 이미 갖고 있는 capture.store를 그대로 공유하게 함 -
+                # 주기적 오드 재생 스케줄러(_schedule_periodic_regen)가 같은 이유로 capture.store를
+                # 재사용하는 것과 동일한 패턴. 두 인스턴스가 따로 놀면 삭제해도 LiveCapture 쪽의
+                # 옛 메모리 상태가 다음 저장 때 되살려버리는 문제가 생긴다.
+                run_gui_qt(event_queue, status_queue, opacity=args.opacity, store=capture.store if capture is not None else None)
+            except Exception as e:
+                print(f"PySide6 GUI 실행 실패 ({e}), 기존 Tkinter GUI로 전환합니다.")
+                try:
+                    run_gui(event_queue, status_queue, opacity=args.opacity)
+                except Exception as e2:
+                    print(f"GUI 실행 실패 ({e2}), 콘솔 모드로 전환합니다.")
+                    run_console(event_queue, status_queue)
+    finally:
+        if capture is not None:
+            capture.stop()
 
 
 if __name__ == "__main__":

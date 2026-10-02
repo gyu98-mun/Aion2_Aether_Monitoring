@@ -193,6 +193,15 @@ class CharacterStore:
         self._save()
         self._notify(nickname)
 
+    def update_sanctuaries(self, nickname, counts):
+        if counts is None:
+            return
+        record = self._get_or_create(nickname)
+        record['sanctuary_counts'] = {key: list(value) for key, value in counts.items()}
+        record['sanctuary_updated'] = datetime.datetime.now().isoformat(timespec='seconds')
+        self._save()
+        self._notify(nickname)
+
     def update_combat_power(self, nickname, combat_power, entity_id=None):
         """전투력 갱신. 오드에너지처럼 history 를 남기진 않는다 - 필요해지면 그때 추가."""
         record = self._get_or_create(nickname)
